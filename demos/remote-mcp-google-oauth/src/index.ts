@@ -6,7 +6,7 @@ import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 import { GoogleHandler } from "./google-handler";
 
-// Context from the auth process, encrypted and stored in the auth token.
+// Google OAuth context, encrypted and stored in the auth token.
 export type Props = {
   name: string;
   email: string;
@@ -21,11 +21,23 @@ function createServer() {
     version: "0.1.0",
   });
 
+  // Temporary test tool. YouTube tools will be added next.
   server.registerTool(
     "add",
-    { inputSchema: z.object({ a: z.number(), b: z.number() }) },
+    {
+      description: "Test that the TubePilot MCP server is responding.",
+      inputSchema: z.object({
+        a: z.number(),
+        b: z.number(),
+      }),
+    },
     async ({ a, b }) => ({
-      content: [{ text: String(a + b), type: "text" }],
+      content: [
+        {
+          type: "text",
+          text: String(a + b),
+        },
+      ],
     }),
   );
 
@@ -45,5 +57,7 @@ export default new OAuthProvider<Env>({
   clientRegistrationEndpoint: "/register",
   defaultHandler: GoogleHandler as any,
   tokenEndpoint: "/token",
-  resourceMetadata: { resource: env.MCP_RESOURCE },
+  resourceMetadata: {
+    resource: env.MCP_RESOURCE,
+  },
 });
