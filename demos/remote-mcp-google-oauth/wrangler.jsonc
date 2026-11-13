@@ -11,7 +11,7 @@
   // The URL MCP clients connect to. Set it to your deployed URL, for example
   // https://<worker-name>.<your-subdomain>.workers.dev/mcp
   "vars": {
-    "MCP_RESOURCE": "http://localhost:8788/mcp",
+    "MCP_RESOURCE": "https://mcp-google-oauth.priyanshunayak7488.workers.dev/mcp",
   },
   "kv_namespaces": [
     {
