@@ -165,7 +165,30 @@ app.get("/callback", async (c) => {
 		return c.text("Missing code", 400);
 	}
 
-	const [accessToken, googleErrResponse] = await fetchUpstreamAuthToken({
+	
+const [tokens, googleErrResponse] = await fetchUpstreamAuthToken({
+  clientId: c.env.GOOGLE_CLIENT_ID,
+  clientSecret: c.env.GOOGLE_CLIENT_SECRET,
+  code,
+  grantType: "authorization_code",
+  redirectUri: new URL("/callback", c.req.url).href,
+  upstreamUrl: "https://oauth2.googleapis.com/token",
+});
+
+if (googleErrResponse) {
+  return googleErrResponse;
+}
+
+const accessToken = tokens.access_token;
+const refreshToken = tokens.refresh_token;
+
+if (!refreshToken) {
+  return c.text(
+    "Google did not return a refresh token. Please revoke the previous app permission and authorize again.",
+    400,
+  );
+}
+
 		clientId: c.env.GOOGLE_CLIENT_ID,
 		clientSecret: c.env.GOOGLE_CLIENT_SECRET,
 		code,
@@ -199,10 +222,12 @@ app.get("/callback", async (c) => {
 			label: name,
 		},
 		props: {
-			accessToken,
-			email,
-			name,
-		} as Props,
+  accessToken,
+  refreshToken,
+  expiresIn: tokens.expires_in,
+  email,
+  name,
+} as Props,
 		request: oauthReqInfo,
 		scope: oauthReqInfo.scope,
 		userId: id,
