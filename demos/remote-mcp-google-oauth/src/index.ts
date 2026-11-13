@@ -1,3 +1,4 @@
+
 import { env } from "cloudflare:workers";
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import { McpServer } from "@modelcontextprotocol/server";
@@ -6,45 +7,43 @@ import { z } from "zod";
 import { GoogleHandler } from "./google-handler";
 
 // Context from the auth process, encrypted and stored in the auth token.
-// Read it inside the server with `getMcpAuthContext()?.props`.
 export type Props = {
-    name: string;
-    email: string;
-    accessToken: string;
-    refreshToken: string;
-    expiresIn?: number;
+  name: string;
+  email: string;
+  accessToken: string;
+  refreshToken: string;
+  expiresIn?: number;
 };
 
 function createServer() {
-	const server = new McpServer({
-		name: "Google OAuth Proxy Demo",
-		version: "0.0.1",
-	});
+  const server = new McpServer({
+    name: "TubePilot AI",
+    version: "0.1.0",
+  });
 
-	server.registerTool(
-		"add",
-		{ inputSchema: z.object({ a: z.number(), b: z.number() }) },
-		async ({ a, b }) => ({
-			content: [{ text: String(a + b), type: "text" }],
-		}),
-	);
+  server.registerTool(
+    "add",
+    { inputSchema: z.object({ a: z.number(), b: z.number() }) },
+    async ({ a, b }) => ({
+      content: [{ text: String(a + b), type: "text" }],
+    }),
+  );
 
-	return server;
+  return server;
 }
 
 const mcpHandler = createMcpHandler(createServer);
 
 export default new OAuthProvider<Env>({
-	apiHandler: {
-		fetch(request: Request, env: Env, ctx: ExecutionContext) {
-			return mcpHandler(request, env, ctx);
-		},
-	},
-	apiRoute: "/mcp",
-	authorizeEndpoint: "/authorize",
-	clientRegistrationEndpoint: "/register",
-	defaultHandler: GoogleHandler as any,
-	tokenEndpoint: "/token",
-	// The URL MCP clients connect to. Every token is bound to it.
-	resourceMetadata: { resource: env.MCP_RESOURCE },
+  apiHandler: {
+    fetch(request: Request, env: Env, ctx: ExecutionContext) {
+      return mcpHandler(request, env, ctx);
+    },
+  },
+  apiRoute: "/mcp",
+  authorizeEndpoint: "/authorize",
+  clientRegistrationEndpoint: "/register",
+  defaultHandler: GoogleHandler as any,
+  tokenEndpoint: "/token",
+  resourceMetadata: { resource: env.MCP_RESOURCE },
 });
