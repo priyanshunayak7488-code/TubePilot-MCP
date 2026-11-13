@@ -39,6 +39,7 @@ export interface GoogleTokenResponse {
 
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
+// Exchange Google's authorization code for access and refresh tokens.
 export async function fetchUpstreamAuthToken({
   clientId,
   clientSecret,
@@ -83,13 +84,16 @@ export async function fetchUpstreamAuthToken({
   const body = (await resp.json()) as GoogleTokenResponse;
 
   if (!body.access_token) {
-    return [null, new Response("Missing access token", { status: 400 })];
+    return [
+      null,
+      new Response("Missing access token", { status: 400 }),
+    ];
   }
 
   return [body, null];
 }
 
-// Refresh an expired Google access token.
+// Exchange a refresh token for a new Google access token.
 export async function refreshGoogleAccessToken({
   clientId,
   clientSecret,
@@ -128,9 +132,7 @@ export async function refreshGoogleAccessToken({
   if (!body.access_token) {
     return [
       null,
-      new Response("Google did not return a refreshed access token.", {
-        status: 401,
-      }),
+      new Response("Missing refreshed access token", { status: 401 }),
     ];
   }
 
