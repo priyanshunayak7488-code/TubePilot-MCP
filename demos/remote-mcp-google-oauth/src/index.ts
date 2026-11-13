@@ -10,7 +10,6 @@ import { z } from "zod";
 import { GoogleHandler } from "./google-handler";
 import { refreshGoogleAccessToken } from "./utils";
 
-// Properties saved during Google OAuth authorization.
 export type Props = {
   name: string;
   email: string;
@@ -19,16 +18,63 @@ export type Props = {
   expiresIn?: number;
 };
 
+const dateSchema = z.string().regex(
+  /^\d{4}-\d{2}-\d{2}$/,
+  "Use YYYY-MM-DD format",
+);
+
 function createServer() {
   const server = new McpServer({
     name: "TubePilot AI",
-    version: "0.2.0",
+    version: "0.3.0",
   });
 
-  // Read the authenticated user's encrypted OAuth properties.
   const props = getMcpAuthContext()?.props as
     | Props
     | undefined;
+
+  // Shared date validation.
+  function validateDates(startDate: string, endDate: string) {
+    if (startDate > endDate) {
+      return "Start date must not be later than end date.";
+    }
+
+    const start = new Date(`${startDate}T00:00:00Z`);
+    const end = new Date(`${endDate}T00:00:00Z`);
+
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime()) ||
+      start.toISOString().slice(0, 10) !== startDate ||
+      end.toISOString().slice(0, 10) !== endDate
+    ) {
+      return "Invalid calendar date. Use YYYY-MM-DD.";
+    }
+
+    return null;
+  }
+
+  // Shared Google access-token refresh.
+  async function getGoogleAccessToken() {
+    if (!props?.refreshToken) {
+      throw new Error(
+        "Google account is not connected. Please authorize TubePilot again.",
+      );
+    }
+
+    const [tokens, refreshError] =
+      await refreshGoogleAccessToken({
+        clientId: env.GOOGLE_CLIENT_ID,
+        clientSecret: env.GOOGLE_CLIENT_SECRET,
+        refreshToken: props.refreshToken,
+      });
+
+    if (refreshError) {
+      throw new Error(await refreshError.text());
+    }
+
+    return tokens.access_token;
+  }
 
   // Tool 1: Connection test.
   server.registerTool(
@@ -51,122 +97,49 @@ function createServer() {
     }),
   );
 
-  // Tool 2: YouTube channel analytics.
+  // Tool 2: Channel-level analytics.
   server.registerTool(
     "youtube_channel_analytics",
     {
       description:
-        "Get real YouTube channel analytics for a date range, including views, watch time, average view duration, subscribers gained and subscribers lost.",
+        "Get channel-level YouTube analytics including views, watch time, average view duration and subscriber changes.",
       inputSchema: z.object({
-        startDate: z.string().regex(
-          /^\d{4}-\d{2}-\d{2}$/,
-          "Use YYYY-MM-DD format",
-        ),
-        endDate: z.string().regex(
-          /^\d{4}-\d{2}-\d{2}$/,
-          "Use YYYY-MM-DD format",
-        ),
+        startDate: dateSchema,
+        endDate: dateSchema,
       }),
     },
     async ({ startDate, endDate }) => {
       try {
-        if (startDate > endDate) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text:
-                  "Start date must not be later than end date.",
-              },
-            ],
-          };
+        const dateError = validateDates(startDate, endDate);
+
+        if (dateError) {
+          throw new Error(dateError);
         }
 
-        if (!props?.refreshToken) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text:
-                  "Google account is not connected. Please authorize TubePilot again.",
-              },
-            ],
-          };
-        }
+        const accessToken = await getGoogleAccessToken();
 
-        // Obtain a fresh Google access token.
-        const [tokens, refreshError] =
-          await refreshGoogleAccessToken({
-            clientId: env.GOOGLE_CLIENT_ID,
-            clientSecret: env.GOOGLE_CLIENT_SECRET,
-            refreshToken: props.refreshToken,
-          });
-
-        if (refreshError) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text: await refreshError.text(),
-              },
-            ],
-          };
-        }
-
-        // Request channel-level analytics.
-        const analyticsUrl = new URL(
+        const url = new URL(
           "https://youtubeanalytics.googleapis.com/v2/reports",
         );
 
-        analyticsUrl.searchParams.set(
-          "ids",
-          "channel==MINE",
-        );
-        analyticsUrl.searchParams.set(
-          "startDate",
-          startDate,
-        );
-        analyticsUrl.searchParams.set(
-          "endDate",
-          endDate,
-        );
-        analyticsUrl.searchParams.set(
+        url.searchParams.set("ids", "channel==MINE");
+        url.searchParams.set("startDate", startDate);
+        url.searchParams.set("endDate", endDate);
+        url.searchParams.set(
           "metrics",
           "views,estimatedMinutesWatched,averageViewDuration,subscribersGained,subscribersLost",
         );
 
-        const response = await fetch(
-          analyticsUrl.toString(),
-          {
-            method: "GET",
-            headers: {
-              Authorization:
-                `Bearer ${tokens.access_token}`,
-            },
+        const response = await fetch(url.toString(), {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
           },
-        );
+        });
 
         if (!response.ok) {
-          const errorText = await response.text();
-
-          console.error(
-            "YouTube Analytics API error:",
-            response.status,
+          throw new Error(
+            `YouTube Analytics API returned ${response.status}: ${await response.text()}`,
           );
-
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text:
-                  `YouTube Analytics API returned ${response.status}: ${errorText}`,
-              },
-            ],
-          };
         }
 
         const report = await response.json();
@@ -177,11 +150,8 @@ function createServer() {
               type: "text",
               text: JSON.stringify(
                 {
-                  channel: props.name,
-                  period: {
-                    startDate,
-                    endDate,
-                  },
+                  channel: props?.name,
+                  period: { startDate, endDate },
                   source: "YouTube Analytics API",
                   report,
                 },
@@ -192,10 +162,7 @@ function createServer() {
           ],
         };
       } catch (error) {
-        console.error(
-          "TubePilot analytics error:",
-          error,
-        );
+        console.error("Channel analytics error:", error);
 
         return {
           isError: true,
@@ -203,7 +170,98 @@ function createServer() {
             {
               type: "text",
               text:
-                "Unable to retrieve YouTube analytics. Please try again.",
+                error instanceof Error
+                  ? error.message
+                  : "Unable to retrieve channel analytics.",
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // Tool 3: Individual video analytics.
+  server.registerTool(
+    "youtube_video_analytics",
+    {
+      description:
+        "Get individual video performance from the authenticated YouTube channel, including video IDs, views, watch time, average view duration and subscriber changes. Results are sorted by views.",
+      inputSchema: z.object({
+        startDate: dateSchema,
+        endDate: dateSchema,
+        maxResults: z.number().int().min(1).max(200).default(100),
+      }),
+    },
+    async ({ startDate, endDate, maxResults }) => {
+      try {
+        const dateError = validateDates(startDate, endDate);
+
+        if (dateError) {
+          throw new Error(dateError);
+        }
+
+        const accessToken = await getGoogleAccessToken();
+
+        const url = new URL(
+          "https://youtubeanalytics.googleapis.com/v2/reports",
+        );
+
+        url.searchParams.set("ids", "channel==MINE");
+        url.searchParams.set("startDate", startDate);
+        url.searchParams.set("endDate", endDate);
+        url.searchParams.set(
+          "metrics",
+          "views,estimatedMinutesWatched,averageViewDuration,subscribersGained,subscribersLost",
+        );
+        url.searchParams.set("dimensions", "video");
+        url.searchParams.set("sort", "-views");
+        url.searchParams.set("maxResults", String(maxResults));
+
+        const response = await fetch(url.toString(), {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        });
+
+        if (!response.ok) {
+          throw new Error(
+            `YouTube Analytics API returned ${response.status}: ${await response.text()}`,
+          );
+        }
+
+        const report = await response.json();
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  channel: props?.name,
+                  period: { startDate, endDate },
+                  resultType: "Individual video analytics",
+                  sortedBy: "Views descending",
+                  source: "YouTube Analytics API",
+                  report,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        console.error("Video analytics error:", error);
+
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text:
+                error instanceof Error
+                  ? error.message
+                  : "Unable to retrieve video analytics.",
             },
           ],
         };
