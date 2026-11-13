@@ -1,4 +1,3 @@
-const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 export async function refreshGoogleAccessToken({
   clientId,
@@ -39,7 +38,7 @@ export async function refreshGoogleAccessToken({
   }
 
   return [body, null];
-}
+
 export function getUpstreamAuthorizeUrl({
   upstreamUrl,
   clientId,
