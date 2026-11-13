@@ -8,9 +8,11 @@ import { GoogleHandler } from "./google-handler";
 // Context from the auth process, encrypted and stored in the auth token.
 // Read it inside the server with `getMcpAuthContext()?.props`.
 export type Props = {
-	name: string;
-	email: string;
-	accessToken: string;
+    name: string;
+    email: string;
+    accessToken: string;
+    refreshToken: string;
+    expiresIn?: number;
 };
 
 function createServer() {
