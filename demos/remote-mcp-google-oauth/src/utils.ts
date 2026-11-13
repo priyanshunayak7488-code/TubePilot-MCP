@@ -1,4 +1,45 @@
+const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
+export async function refreshGoogleAccessToken({
+  clientId,
+  clientSecret,
+  refreshToken,
+}: {
+  clientId: string;
+  clientSecret: string;
+  refreshToken: string;
+}): Promise<[GoogleTokenResponse, null] | [null, Response]> {
+  const resp = await fetch(GOOGLE_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    }).toString(),
+  });
+
+  if (!resp.ok) {
+    console.error("Google token refresh failed:", resp.status);
+    return [
+      null,
+      new Response("Google token refresh failed. Please reconnect your Google account.", {
+        status: 401,
+      }),
+    ];
+  }
+
+  const body = (await resp.json()) as GoogleTokenResponse;
+
+  if (!body.access_token) {
+    return [null, new Response("Missing refreshed access token", { status: 401 })];
+  }
+
+  return [body, null];
+}
 export function getUpstreamAuthorizeUrl({
   upstreamUrl,
   clientId,
