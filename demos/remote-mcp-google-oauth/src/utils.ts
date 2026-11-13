@@ -1,44 +1,4 @@
 
-export async function refreshGoogleAccessToken({
-  clientId,
-  clientSecret,
-  refreshToken,
-}: {
-  clientId: string;
-  clientSecret: string;
-  refreshToken: string;
-}): Promise<[GoogleTokenResponse, null] | [null, Response]> {
-  const resp = await fetch(GOOGLE_TOKEN_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      refresh_token: refreshToken,
-      grant_type: "refresh_token",
-    }).toString(),
-  });
-
-  if (!resp.ok) {
-    console.error("Google token refresh failed:", resp.status);
-    return [
-      null,
-      new Response("Google token refresh failed. Please reconnect your Google account.", {
-        status: 401,
-      }),
-    ];
-  }
-
-  const body = (await resp.json()) as GoogleTokenResponse;
-
-  if (!body.access_token) {
-    return [null, new Response("Missing refreshed access token", { status: 401 })];
-  }
-
-  return [body, null];
-
 export function getUpstreamAuthorizeUrl({
   upstreamUrl,
   clientId,
@@ -79,7 +39,6 @@ export interface GoogleTokenResponse {
 
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
-// Exchange Google's authorization code for access and refresh tokens.
 export async function fetchUpstreamAuthToken({
   clientId,
   clientSecret,
@@ -115,25 +74,18 @@ export async function fetchUpstreamAuthToken({
 
   if (!resp.ok) {
     console.error("Google token exchange failed:", resp.status);
-    return [
-      null,
-      new Response("Failed to fetch access token", { status: 500 }),
-    ];
+    return [null, new Response("Failed to fetch access token", { status: 500 })];
   }
 
   const body = (await resp.json()) as GoogleTokenResponse;
 
   if (!body.access_token) {
-    return [
-      null,
-      new Response("Missing access token", { status: 400 }),
-    ];
+    return [null, new Response("Missing access token", { status: 400 })];
   }
 
   return [body, null];
 }
 
-// Exchange a refresh token for a new Google access token.
 export async function refreshGoogleAccessToken({
   clientId,
   clientSecret,
@@ -160,20 +112,16 @@ export async function refreshGoogleAccessToken({
     console.error("Google token refresh failed:", resp.status);
     return [
       null,
-      new Response(
-        "Google token refresh failed. Please reconnect your Google account.",
-        { status: 401 },
-      ),
+      new Response("Google token refresh failed. Please reconnect your Google account.", {
+        status: 401,
+      }),
     ];
   }
 
   const body = (await resp.json()) as GoogleTokenResponse;
 
   if (!body.access_token) {
-    return [
-      null,
-      new Response("Missing refreshed access token", { status: 401 }),
-    ];
+    return [null, new Response("Missing refreshed access token", { status: 401 })];
   }
 
   return [body, null];
