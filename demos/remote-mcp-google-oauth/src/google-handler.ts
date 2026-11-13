@@ -189,17 +189,6 @@ if (!refreshToken) {
   );
 }
 
-		clientId: c.env.GOOGLE_CLIENT_ID,
-		clientSecret: c.env.GOOGLE_CLIENT_SECRET,
-		code,
-		grantType: "authorization_code",
-		redirectUri: new URL("/callback", c.req.url).href,
-		upstreamUrl: "https://accounts.google.com/o/oauth2/token",
-	});
-	if (googleErrResponse) {
-		return googleErrResponse;
-	}
-
 	// Fetch the user info from Google
 	const userResponse = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
 		headers: {
