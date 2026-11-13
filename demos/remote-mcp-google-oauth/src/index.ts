@@ -26,7 +26,7 @@ const dateSchema = z.string().regex(
 function createServer() {
   const server = new McpServer({
     name: "TubePilot AI",
-    version: "0.3.0",
+    version: "0.4.0",
   });
 
   const props = getMcpAuthContext()?.props as
@@ -262,6 +262,141 @@ function createServer() {
                 error instanceof Error
                   ? error.message
                   : "Unable to retrieve video analytics.",
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // Tool 4: YouTube video metadata.
+  server.registerTool(
+    "youtube_video_metadata",
+    {
+      description:
+        "Retrieve YouTube video titles, descriptions, publication dates, durations, thumbnails and video URLs for up to 50 video IDs. Also identifies potential Shorts based on duration.",
+      inputSchema: z.object({
+        videoIds: z.array(z.string().min(1)).min(1).max(50),
+      }),
+    },
+    async ({ videoIds }) => {
+      try {
+        const uniqueIds = [...new Set(videoIds)];
+        const accessToken = await getGoogleAccessToken();
+
+        const url = new URL(
+          "https://www.googleapis.com/youtube/v3/videos",
+        );
+
+        url.searchParams.set("part", "snippet,contentDetails");
+        url.searchParams.set("id", uniqueIds.join(","));
+
+        const response = await fetch(url.toString(), {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        });
+
+        if (!response.ok) {
+          throw new Error(
+            `YouTube Data API returned ${response.status}: ${await response.text()}`,
+          );
+        }
+
+        const data = await response.json() as {
+          items?: Array<{
+            id: string;
+            snippet: {
+              title: string;
+              description: string;
+              publishedAt: string;
+              channelTitle: string;
+              thumbnails?: {
+                high?: { url: string };
+                medium?: { url: string };
+                default?: { url: string };
+              };
+            };
+            contentDetails: {
+              duration: string;
+            };
+          }>;
+        };
+
+        function durationToSeconds(duration: string): number {
+          const match = duration.match(
+            /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/,
+          );
+
+          if (!match) return 0;
+
+          return (
+            Number(match[1] || 0) * 3600 +
+            Number(match[2] || 0) * 60 +
+            Number(match[3] || 0)
+          );
+        }
+
+        const videos = (data.items || []).map((video) => {
+          const durationSeconds = durationToSeconds(
+            video.contentDetails.duration,
+          );
+
+          return {
+            videoId: video.id,
+            title: video.snippet.title,
+            description: video.snippet.description,
+            publishedAt: video.snippet.publishedAt,
+            channelTitle: video.snippet.channelTitle,
+            duration: video.contentDetails.duration,
+            durationSeconds,
+            formatCandidate:
+              durationSeconds <= 180
+                ? "Potential Short — verify aspect ratio"
+                : "Long-form candidate",
+            thumbnail:
+              video.snippet.thumbnails?.high?.url ||
+              video.snippet.thumbnails?.medium?.url ||
+              video.snippet.thumbnails?.default?.url ||
+              null,
+            videoUrl: `https://www.youtube.com/watch?v=${video.id}`,
+          };
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  channel: props?.name,
+                  requestedVideos: uniqueIds.length,
+                  returnedVideos: videos.length,
+                  missingOrUnavailableIds: uniqueIds.filter(
+                    (id) =>
+                      !videos.some((video) => video.videoId === id),
+                  ),
+                  source: "YouTube Data API v3",
+                  videos,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        console.error("Video metadata error:", error);
+
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text:
+                error instanceof Error
+                  ? error.message
+                  : "Unable to retrieve video metadata.",
             },
           ],
         };
