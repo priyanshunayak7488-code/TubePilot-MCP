@@ -15,6 +15,7 @@ export function getUpstreamAuthorizeUrl({
   hostedDomain?: string;
 }) {
   const upstream = new URL(upstreamUrl);
+
   upstream.searchParams.set("client_id", clientId);
   upstream.searchParams.set("redirect_uri", redirectUri);
   upstream.searchParams.set("scope", scope);
@@ -35,6 +36,8 @@ export interface GoogleTokenResponse {
   token_type?: string;
   scope?: string;
 }
+
+const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 export async function fetchUpstreamAuthToken({
   clientId,
@@ -71,13 +74,64 @@ export async function fetchUpstreamAuthToken({
 
   if (!resp.ok) {
     console.error("Google token exchange failed:", resp.status);
-    return [null, new Response("Failed to fetch access token", { status: 500 })];
+    return [
+      null,
+      new Response("Failed to fetch access token", { status: 500 }),
+    ];
   }
 
   const body = (await resp.json()) as GoogleTokenResponse;
 
   if (!body.access_token) {
     return [null, new Response("Missing access token", { status: 400 })];
+  }
+
+  return [body, null];
+}
+
+// Refresh an expired Google access token.
+export async function refreshGoogleAccessToken({
+  clientId,
+  clientSecret,
+  refreshToken,
+}: {
+  clientId: string;
+  clientSecret: string;
+  refreshToken: string;
+}): Promise<[GoogleTokenResponse, null] | [null, Response]> {
+  const resp = await fetch(GOOGLE_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    }).toString(),
+  });
+
+  if (!resp.ok) {
+    console.error("Google token refresh failed:", resp.status);
+    return [
+      null,
+      new Response(
+        "Google token refresh failed. Please reconnect your Google account.",
+        { status: 401 },
+      ),
+    ];
+  }
+
+  const body = (await resp.json()) as GoogleTokenResponse;
+
+  if (!body.access_token) {
+    return [
+      null,
+      new Response("Google did not return a refreshed access token.", {
+        status: 401,
+      }),
+    ];
   }
 
   return [body, null];
