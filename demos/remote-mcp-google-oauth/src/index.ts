@@ -1451,66 +1451,86 @@ function createServer() {
       }
     }
   );
-  // TOOL 8: UNIVERSAL CONTENT PATTERN DETECTOR
+	
+  // TOOL 8: RELEVANCE-AWARE CONTENT PATTERN DETECTOR
   server.registerTool(
-  "youtube_content_pattern_detector",
-  {
-    description:
-      "Automatically discover small YouTube competitors from a search topic, analyze their recent public uploads, and identify separate Shorts and long-form content patterns.",
-    inputSchema: z.object({
-      query: z
-        .string()
-        .min(2)
-        .max(100)
-        .default("visual riddles brain teasers")
-        .describe("The topic or keyword used to discover relevant YouTube videos and competitor channels"),
+    "youtube_content_pattern_detector",
+    {
+      description:
+        "Discover small YouTube competitors, filter their recent uploads for topic relevance, and analyze separate Shorts and long-form patterns.",
 
-      maxSubscribers: z
-        .number()
-        .int()
-        .min(1)
-        .max(10000000)
-        .default(50000)
-        .describe("Maximum allowed channel subscribers"),
+      inputSchema: z.object({
+        query: z
+          .string()
+          .min(2)
+          .max(100)
+          .default("visual riddles brain teasers")
+          .describe("Topic used to discover competitors and score video relevance"),
 
-      maxCompetitors: z
-        .number()
-        .int()
-        .min(1)
-        .max(10)
-        .default(10)
-        .describe("Maximum number of competitor channels to analyze"),
+        maxSubscribers: z
+          .number()
+          .int()
+          .min(1)
+          .max(10000000)
+          .default(50000)
+          .describe("Maximum allowed channel subscribers"),
 
-      contentType: z
-        .enum(["shorts", "long_form", "both"])
-        .default("both")
-        .describe("Which content format to analyze"),
+        maxCompetitors: z
+          .number()
+          .int()
+          .min(1)
+          .max(10)
+          .default(10)
+          .describe("Maximum competitor channels to analyze"),
 
-      maxVideosPerChannel: z
-        .number()
-        .int()
-        .min(5)
-        .max(50)
-        .default(30)
-        .describe("Maximum recent uploads to retrieve per competitor"),
+        contentType: z
+          .enum(["shorts", "long_form", "both"])
+          .default("both")
+          .describe("Content format to analyze"),
 
-      minimumAgeDays: z
-        .number()
-        .int()
-        .min(0)
-        .max(365)
-        .default(7)
-        .describe("Minimum video age in days for pattern analysis"),
-        }),
-  },
-  async ({
-    query,
-    maxSubscribers,
-    maxCompetitors,
-    contentType,
-    maxVideosPerChannel,
-    minimumAgeDays,
-  }) => {
+        maxVideosPerChannel: z
+          .number()
+          .int()
+          .min(5)
+          .max(50)
+          .default(30)
+          .describe("Maximum recent uploads to retrieve per competitor"),
+
+        minimumAgeDays: z
+          .number()
+          .int()
+          .min(0)
+          .max(365)
+          .default(7)
+          .describe("Minimum video age in days"),
+
+        lookbackDays: z
+          .number()
+          .int()
+          .min(7)
+          .max(730)
+          .default(180)
+          .describe("Only analyze videos published within this many days"),
+
+        minimumRelevanceScore: z
+          .number()
+          .min(1)
+          .max(10)
+          .default(2)
+          .describe("Minimum relevance score required for a video to enter pattern analysis"),
+      }),
+    },
+
+    async ({
+      query,
+      maxSubscribers,
+      maxCompetitors,
+      contentType,
+      maxVideosPerChannel,
+      minimumAgeDays,
+      lookbackDays,
+      minimumRelevanceScore,
+    }) => {
       try {
         const accessToken = await getGoogleAccessToken();
 
@@ -1519,11 +1539,141 @@ function createServer() {
         };
 
         const now = Date.now();
+
         const minimumAgeMs =
           minimumAgeDays * 24 * 60 * 60 * 1000;
 
+        const lookbackMs =
+          lookbackDays * 24 * 60 * 60 * 1000;
+
+        const oldestAllowedDate = new Date(
+          now - lookbackMs
+        );
+
         // --------------------------------------------------
-        // 1. DISCOVER VIDEOS USING THE SEARCH TOPIC
+        // 1. BUILD TOPIC RELEVANCE KEYWORDS
+        // --------------------------------------------------
+
+        const stopWords = new Set([
+          "the", "and", "for", "you", "your", "are",
+          "this", "that", "with", "from", "have", "has",
+          "how", "what", "when", "why", "who", "can",
+          "will", "was", "were", "not", "but", "all",
+          "one", "two", "into", "its", "is", "a", "an",
+          "to", "of", "in", "on", "at", "or", "by",
+          "as", "be", "it",
+        ]);
+
+        const normalizeWords = (value: string): string[] =>
+          value
+            .toLowerCase()
+            .replace(/[^a-z0-9\s]/g, " ")
+            .split(/\s+/)
+            .filter(
+              (word) =>
+                word.length >= 3 &&
+                !stopWords.has(word)
+            );
+
+        const queryTerms = normalizeWords(query);
+
+        // Related vocabulary helps identify relevant videos
+        // even when they do not repeat the exact search query.
+        const relatedGroups: string[][] = [
+          [
+            "riddle", "riddles", "puzzle", "puzzles",
+            "brain", "teaser", "teasers",
+          ],
+          [
+            "visual", "spot", "difference", "differences",
+            "hidden", "find", "picture", "optical",
+            "observation",
+          ],
+          [
+            "quiz", "iq", "logic", "solve", "solution",
+            "mystery", "detective", "reasoning",
+          ],
+          [
+            "math", "maths", "equation", "number",
+            "numbers", "calculation",
+          ],
+        ];
+
+        const expandedTerms = new Set<string>(
+          queryTerms
+        );
+
+        for (const group of relatedGroups) {
+          const queryMatchesGroup = group.some(
+            (word) => queryTerms.includes(word)
+          );
+
+          if (queryMatchesGroup) {
+            for (const word of group) {
+              expandedTerms.add(word);
+            }
+          }
+        }
+
+        const scoreVideoRelevance = (
+          title: string,
+          description: string
+        ) => {
+          const titleWords = normalizeWords(title);
+          const descriptionWords =
+            normalizeWords(description);
+
+          const titleSet = new Set(titleWords);
+          const descriptionSet = new Set(
+            descriptionWords
+          );
+
+          const directMatches = queryTerms.filter(
+            (term) =>
+              titleSet.has(term) ||
+              descriptionSet.has(term)
+          );
+
+          const titleDirectMatches =
+            queryTerms.filter((term) =>
+              titleSet.has(term)
+            );
+
+          const relatedMatches = [
+            ...expandedTerms,
+          ].filter(
+            (term) =>
+              !queryTerms.includes(term) &&
+              (titleSet.has(term) ||
+                descriptionSet.has(term))
+          );
+
+          const titleRelatedMatches = [
+            ...expandedTerms,
+          ].filter(
+            (term) =>
+              !queryTerms.includes(term) &&
+              titleSet.has(term)
+          );
+
+          const score =
+            titleDirectMatches.length * 2 +
+            (directMatches.length -
+              titleDirectMatches.length) +
+            titleRelatedMatches.length * 1.5 +
+            (relatedMatches.length -
+              titleRelatedMatches.length) * 0.5;
+
+          return {
+            score: Math.round(score * 100) / 100,
+            directMatches,
+            relatedMatches,
+            relevant: score >= minimumRelevanceScore,
+          };
+        };
+
+        // --------------------------------------------------
+        // 2. DISCOVER RECENT VIDEOS BY SEARCH TOPIC
         // --------------------------------------------------
 
         const searchUrl = new URL(
@@ -1535,8 +1685,15 @@ function createServer() {
         searchUrl.searchParams.set("q", query);
         searchUrl.searchParams.set("order", "viewCount");
         searchUrl.searchParams.set("maxResults", "50");
+        searchUrl.searchParams.set(
+          "publishedAfter",
+          oldestAllowedDate.toISOString()
+        );
 
-        const searchResponse = await fetch(searchUrl, { headers });
+        const searchResponse = await fetch(
+          searchUrl,
+          { headers }
+        );
 
         if (!searchResponse.ok) {
           return errorResult(
@@ -1544,35 +1701,45 @@ function createServer() {
           );
         }
 
-        const searchData: any = await searchResponse.json();
+        const searchData: any =
+          await searchResponse.json();
+
         const searchItems = searchData.items ?? [];
 
         if (searchItems.length === 0) {
           return errorResult(
-            "No public videos were found for this search topic. Try a broader or different query."
+            "No recent public videos were found for this topic. Try a broader query or a longer lookback period."
           );
         }
 
-        // Preserve channel discovery order from search results.
         const discoveredChannelIds = Array.from(
           new Set(
             searchItems
-              .map((item: any) => item.snippet?.channelId)
+              .map(
+                (item: any) =>
+                  item.snippet?.channelId
+              )
               .filter(
                 (id: any): id is string =>
-                  typeof id === "string" && id.length > 0
+                  typeof id === "string" &&
+                  id.length > 0
               )
           )
         );
 
         // --------------------------------------------------
-        // 2. RETRIEVE CHANNEL INFORMATION
+        // 3. RETRIEVE CHANNEL INFORMATION
         // --------------------------------------------------
 
         const channelDetails: any[] = [];
 
-        for (let i = 0; i < discoveredChannelIds.length; i += 50) {
-          const batch = discoveredChannelIds.slice(i, i + 50);
+        for (
+          let i = 0;
+          i < discoveredChannelIds.length;
+          i += 50
+        ) {
+          const batch =
+            discoveredChannelIds.slice(i, i + 50);
 
           const channelsUrl = new URL(
             "https://www.googleapis.com/youtube/v3/channels"
@@ -1582,11 +1749,16 @@ function createServer() {
             "part",
             "snippet,statistics,contentDetails"
           );
-          channelsUrl.searchParams.set("id", batch.join(","));
 
-          const channelsResponse = await fetch(channelsUrl, {
-            headers,
-          });
+          channelsUrl.searchParams.set(
+            "id",
+            batch.join(",")
+          );
+
+          const channelsResponse = await fetch(
+            channelsUrl,
+            { headers }
+          );
 
           if (!channelsResponse.ok) {
             return errorResult(
@@ -1594,26 +1766,29 @@ function createServer() {
             );
           }
 
-          const channelsData: any = await channelsResponse.json();
+          const channelsData: any =
+            await channelsResponse.json();
 
-          channelDetails.push(...(channelsData.items ?? []));
+          channelDetails.push(
+            ...(channelsData.items ?? [])
+          );
         }
 
-        // Exclude channels with hidden subscriber counts.
-        // Also exclude channels above the requested subscriber limit.
         const eligibleChannels = channelDetails
           .filter((channel) => {
-            const statistics = channel.statistics ?? {};
+            const statistics =
+              channel.statistics ?? {};
 
-            if (statistics.hiddenSubscriberCount === true) {
+            if (
+              statistics.hiddenSubscriberCount === true ||
+              statistics.subscriberCount === undefined
+            ) {
               return false;
             }
 
-            if (statistics.subscriberCount === undefined) {
-              return false;
-            }
-
-            const subscribers = Number(statistics.subscriberCount);
+            const subscribers = Number(
+              statistics.subscriberCount
+            );
 
             return (
               Number.isFinite(subscribers) &&
@@ -1624,26 +1799,32 @@ function createServer() {
 
         if (eligibleChannels.length === 0) {
           return errorResult(
-            "No eligible competitor channels were found. The discovered channels may have hidden subscriber counts or exceed your subscriber limit. Try a broader query or a higher limit."
+            "No eligible competitor channels were found. Try a broader query or a higher subscriber limit."
           );
         }
 
         // --------------------------------------------------
-        // 3. RETRIEVE RECENT UPLOADS FROM EACH COMPETITOR
+        // 4. RETRIEVE RECENT CHANNEL UPLOADS
         // --------------------------------------------------
 
         const channelUploads: any[] = [];
 
         for (const channel of eligibleChannels) {
           const channelId = channel.id;
+
           const uploadsPlaylistId =
-            channel.contentDetails?.relatedPlaylists?.uploads;
+            channel.contentDetails
+              ?.relatedPlaylists?.uploads;
 
           if (!uploadsPlaylistId) {
             channelUploads.push({
               channelId,
-              channelTitle: channel.snippet?.title ?? "Unknown channel",
-              subscribers: Number(channel.statistics?.subscriberCount ?? 0),
+              channelTitle:
+                channel.snippet?.title ??
+                "Unknown channel",
+              subscribers: Number(
+                channel.statistics?.subscriberCount ?? 0
+              ),
               error: "Uploads playlist unavailable",
               videos: [],
             });
@@ -1655,44 +1836,66 @@ function createServer() {
             "https://www.googleapis.com/youtube/v3/playlistItems"
           );
 
-          playlistUrl.searchParams.set("part", "contentDetails");
+          playlistUrl.searchParams.set(
+            "part",
+            "contentDetails"
+          );
+
           playlistUrl.searchParams.set(
             "playlistId",
             uploadsPlaylistId
           );
+
           playlistUrl.searchParams.set(
             "maxResults",
             String(maxVideosPerChannel)
           );
 
-          const playlistResponse = await fetch(playlistUrl, {
-            headers,
-          });
+          const playlistResponse = await fetch(
+            playlistUrl,
+            { headers }
+          );
 
           if (!playlistResponse.ok) {
             channelUploads.push({
               channelId,
-              channelTitle: channel.snippet?.title ?? "Unknown channel",
-              subscribers: Number(channel.statistics?.subscriberCount ?? 0),
-              error: `Upload history request failed: ${playlistResponse.status}`,
+              channelTitle:
+                channel.snippet?.title ??
+                "Unknown channel",
+              subscribers: Number(
+                channel.statistics?.subscriberCount ?? 0
+              ),
+              error:
+                `Upload history request failed: ${playlistResponse.status}`,
               videos: [],
             });
 
             continue;
           }
 
-          const playlistData: any = await playlistResponse.json();
+          const playlistData: any =
+            await playlistResponse.json();
 
-          const videoIds = (playlistData.items ?? [])
-            .map((item: any) => item.contentDetails?.videoId)
+          const videoIds = (
+            playlistData.items ?? []
+          )
+            .map(
+              (item: any) =>
+                item.contentDetails?.videoId
+            )
             .filter(
               (id: any): id is string =>
-                typeof id === "string" && id.length > 0
+                typeof id === "string" &&
+                id.length > 0
             );
 
           const videoDetails: any[] = [];
 
-          for (let i = 0; i < videoIds.length; i += 50) {
+          for (
+            let i = 0;
+            i < videoIds.length;
+            i += 50
+          ) {
             const batch = videoIds.slice(i, i + 50);
 
             if (batch.length === 0) continue;
@@ -1705,117 +1908,178 @@ function createServer() {
               "part",
               "snippet,statistics,contentDetails"
             );
-            videosUrl.searchParams.set("id", batch.join(","));
 
-            const videosResponse = await fetch(videosUrl, {
-              headers,
-            });
+            videosUrl.searchParams.set(
+              "id",
+              batch.join(",")
+            );
+
+            const videosResponse = await fetch(
+              videosUrl,
+              { headers }
+            );
 
             if (!videosResponse.ok) {
               continue;
             }
 
-            const videosData: any = await videosResponse.json();
+            const videosData: any =
+              await videosResponse.json();
 
-            videoDetails.push(...(videosData.items ?? []));
+            videoDetails.push(
+              ...(videosData.items ?? [])
+            );
           }
 
           channelUploads.push({
             channelId,
-            channelTitle: channel.snippet?.title ?? "Unknown channel",
-            subscribers: Number(channel.statistics?.subscriberCount ?? 0),
+            channelTitle:
+              channel.snippet?.title ??
+              "Unknown channel",
+            subscribers: Number(
+              channel.statistics?.subscriberCount ?? 0
+            ),
             videos: videoDetails,
           });
         }
 
-        const channelsWithUploads = channelUploads.filter(
-          (channel) =>
-            !channel.error && channel.videos.length > 0
-        );
+        const channelsWithUploads =
+          channelUploads.filter(
+            (channel) =>
+              !channel.error &&
+              channel.videos.length > 0
+          );
 
         // --------------------------------------------------
-        // 4. PREPARE AND FILTER THE VIDEO DATA
+        // 5. APPLY AGE AND RELEVANCE FILTERS
         // --------------------------------------------------
 
         const videosByChannel: any[] = [];
 
+        let videosExcludedByAge = 0;
+        let videosExcludedByRelevance = 0;
+        let videosExcludedMissingDate = 0;
+
         for (const channel of channelsWithUploads) {
-          const eligibleVideos = channel.videos
-            .map((video: any) => {
-              const publishedAt = video.snippet?.publishedAt;
+          const eligibleVideos: any[] = [];
 
-              if (!publishedAt) return undefined;
+          for (const video of channel.videos) {
+            const publishedAt =
+              video.snippet?.publishedAt;
 
-              const publishedDate = new Date(publishedAt);
+            if (!publishedAt) {
+              videosExcludedMissingDate++;
+              continue;
+            }
 
-              if (Number.isNaN(publishedDate.getTime())) {
-                return undefined;
-              }
+            const publishedDate =
+              new Date(publishedAt);
 
-              const ageMs =
-                now - publishedDate.getTime();
+            if (
+              Number.isNaN(
+                publishedDate.getTime()
+              )
+            ) {
+              videosExcludedMissingDate++;
+              continue;
+            }
 
-              if (ageMs < minimumAgeMs) {
-                return undefined;
-              }
+            const ageMs =
+              now - publishedDate.getTime();
 
-              const durationSeconds = durationToSeconds(
+            if (
+              ageMs < minimumAgeMs ||
+              ageMs > lookbackMs
+            ) {
+              videosExcludedByAge++;
+              continue;
+            }
+
+            const title =
+              video.snippet?.title ?? "Untitled";
+
+            const description =
+              video.snippet?.description ?? "";
+
+            const relevance =
+              scoreVideoRelevance(
+                title,
+                description
+              );
+
+            if (!relevance.relevant) {
+              videosExcludedByRelevance++;
+              continue;
+            }
+
+            const durationSeconds =
+              durationToSeconds(
                 video.contentDetails?.duration
               );
 
-              const statistics = video.statistics ?? {};
+            const statistics =
+              video.statistics ?? {};
 
-              const likesAvailable =
-                statistics.likeCount !== undefined;
+            const likesAvailable =
+              statistics.likeCount !== undefined;
 
-              const commentsAvailable =
-                statistics.commentCount !== undefined;
+            const commentsAvailable =
+              statistics.commentCount !== undefined;
 
-              const likes = likesAvailable
-                ? Number(statistics.likeCount)
-                : null;
+            const likes = likesAvailable
+              ? Number(statistics.likeCount)
+              : null;
 
-              const comments = commentsAvailable
-                ? Number(statistics.commentCount)
-                : null;
+            const comments = commentsAvailable
+              ? Number(statistics.commentCount)
+              : null;
 
-              const views = Number(statistics.viewCount ?? 0);
-
-              let engagementRate: number | null = null;
-
-              if (
-                views > 0 &&
-                likes !== null &&
-                comments !== null
-              ) {
-                engagementRate =
-                  ((likes + comments) / views) * 100;
-              }
-
-              return {
-                videoId: video.id,
-                title: video.snippet?.title ?? "Untitled",
-                description: video.snippet?.description ?? "",
-                publishedAt,
-                publishedTime: publishedDate.getTime(),
-                publishedHourUTC: publishedDate.getUTCHours(),
-                publishedDayUTC: publishedDate.getUTCDay(),
-                durationSeconds,
-                views,
-                likes,
-                comments,
-                engagementRate,
-                videoUrl: `https://www.youtube.com/watch?v=${video.id}`,
-                thumbnail:
-                  video.snippet?.thumbnails?.high?.url ??
-                  video.snippet?.thumbnails?.medium?.url ??
-                  video.snippet?.thumbnails?.default?.url ??
-                  null,
-              };
-            })
-            .filter(
-              (video: any) => video !== undefined
+            const views = Number(
+              statistics.viewCount ?? 0
             );
+
+            let engagementRate: number | null =
+              null;
+
+            if (
+              views > 0 &&
+              likes !== null &&
+              comments !== null
+            ) {
+              engagementRate =
+                ((likes + comments) / views) * 100;
+            }
+
+            eligibleVideos.push({
+              videoId: video.id,
+              title,
+              description,
+              publishedAt,
+              publishedTime:
+                publishedDate.getTime(),
+              publishedHourUTC:
+                publishedDate.getUTCHours(),
+              publishedDayUTC:
+                publishedDate.getUTCDay(),
+              durationSeconds,
+              views,
+              likes,
+              comments,
+              engagementRate,
+              relevanceScore: relevance.score,
+              matchedQueryTerms:
+                relevance.directMatches,
+              matchedRelatedTerms:
+                relevance.relatedMatches,
+              videoUrl:
+                `https://www.youtube.com/watch?v=${video.id}`,
+              thumbnail:
+                video.snippet?.thumbnails?.high?.url ??
+                video.snippet?.thumbnails?.medium?.url ??
+                video.snippet?.thumbnails?.default?.url ??
+                null,
+            });
+          }
 
           videosByChannel.push({
             channelId: channel.channelId,
@@ -1826,7 +2090,7 @@ function createServer() {
         }
 
         // --------------------------------------------------
-        // 5. SPLIT SHORTS AND LONG-FORM VIDEOS
+        // 6. SPLIT SHORTS AND LONG-FORM VIDEOS
         // --------------------------------------------------
 
         const allVideos = videosByChannel.flatMap(
@@ -1840,15 +2104,17 @@ function createServer() {
         );
 
         const shortVideos = allVideos.filter(
-          (video) => video.durationSeconds <= 180
+          (video) =>
+            video.durationSeconds <= 180
         );
 
         const longVideos = allVideos.filter(
-          (video) => video.durationSeconds > 180
+          (video) =>
+            video.durationSeconds > 180
         );
 
         // --------------------------------------------------
-        // 6. ANALYZE CONTENT PATTERNS
+        // 7. ANALYZE CONTENT PATTERNS
         // --------------------------------------------------
 
         const analyzeFormat = (
@@ -1859,7 +2125,8 @@ function createServer() {
             return {
               format: formatName,
               videosAnalyzed: 0,
-              message: "No eligible videos were found for this format.",
+              message:
+                "No relevant videos passed the selected filters.",
             };
           }
 
@@ -1872,7 +2139,9 @@ function createServer() {
           );
 
           const engagementValues = videos
-            .map((video) => video.engagementRate)
+            .map(
+              (video) => video.engagementRate
+            )
             .filter(
               (value: any): value is number =>
                 typeof value === "number" &&
@@ -1895,63 +2164,15 @@ function createServer() {
                 ) / engagementValues.length
               : null;
 
-          // Count recurring title words.
-          const stopWords = new Set([
-            "the",
-            "and",
-            "for",
-            "you",
-            "your",
-            "are",
-            "this",
-            "that",
-            "with",
-            "from",
-            "have",
-            "has",
-            "how",
-            "what",
-            "when",
-            "why",
-            "who",
-            "can",
-            "will",
-            "was",
-            "were",
-            "not",
-            "but",
-            "all",
-            "one",
-            "two",
-            "into",
-            "its",
-            "is",
-            "a",
-            "an",
-            "to",
-            "of",
-            "in",
-            "on",
-            "at",
-            "or",
-            "by",
-            "as",
-            "be",
-            "it",
-          ]);
-
-          const wordCounts: Record<string, number> = {};
+          const wordCounts: Record<
+            string,
+            number
+          > = {};
 
           for (const video of videos) {
-            const words = video.title
-              .toLowerCase()
-              .replace(/[^a-z0-9\s]/g, " ")
-              .split(/\s+/)
-              .filter(
-                (word: string) =>
-                  word.length >= 3 &&
-                  !stopWords.has(word)
-              );
+            const words = normalizeWords(
+              video.title
+            );
 
             for (const word of new Set(words)) {
               wordCounts[word] =
@@ -1959,32 +2180,42 @@ function createServer() {
             }
           }
 
-          const recurringTitleWords = Object.entries(
-            wordCounts
-          )
-            .filter(([, count]) => count >= 2)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 15)
-            .map(([word, count]) => ({
-              word,
-              appearances: count,
-            }));
+          const recurringTitleWords =
+            Object.entries(wordCounts)
+              .filter(
+                ([, count]) => count >= 2
+              )
+              .sort(
+                (a, b) => b[1] - a[1]
+              )
+              .slice(0, 15)
+              .map(([word, count]) => ({
+                word,
+                appearances: count,
+              }));
 
-          // Title structure indicators.
-          const questionTitleCount = videos.filter(
-            (video) => video.title.includes("?")
-          ).length;
+          const questionTitleCount =
+            videos.filter(
+              (video) =>
+                video.title.includes("?")
+            ).length;
 
-          const hashtagTitleCount = videos.filter(
-            (video) => /#[a-z0-9_]+/i.test(video.title)
-          ).length;
+          const hashtagTitleCount =
+            videos.filter(
+              (video) =>
+                /#[a-z0-9_]+/i.test(video.title)
+            ).length;
 
-          const numberTitleCount = videos.filter(
-            (video) => /\d/.test(video.title)
-          ).length;
+          const numberTitleCount =
+            videos.filter(
+              (video) =>
+                /\d/.test(video.title)
+            ).length;
 
-          // Duration distribution.
-          const durationBuckets: Record<string, number> =
+          const durationBuckets: Record<
+            string,
+            number
+          > =
             formatName === "Shorts"
               ? {
                   "0–15 seconds": 0,
@@ -2004,34 +2235,60 @@ function createServer() {
           for (const duration of durations) {
             if (formatName === "Shorts") {
               if (duration <= 15) {
-                durationBuckets["0–15 seconds"]++;
+                durationBuckets[
+                  "0–15 seconds"
+                ]++;
               } else if (duration <= 30) {
-                durationBuckets["16–30 seconds"]++;
+                durationBuckets[
+                  "16–30 seconds"
+                ]++;
               } else if (duration <= 60) {
-                durationBuckets["31–60 seconds"]++;
+                durationBuckets[
+                  "31–60 seconds"
+                ]++;
               } else if (duration <= 90) {
-                durationBuckets["61–90 seconds"]++;
+                durationBuckets[
+                  "61–90 seconds"
+                ]++;
               } else {
-                durationBuckets["91–180 seconds"]++;
+                durationBuckets[
+                  "91–180 seconds"
+                ]++;
               }
             } else {
               if (duration <= 300) {
-                durationBuckets["181–300 seconds"]++;
+                durationBuckets[
+                  "181–300 seconds"
+                ]++;
               } else if (duration <= 600) {
-                durationBuckets["301–600 seconds"]++;
+                durationBuckets[
+                  "301–600 seconds"
+                ]++;
               } else if (duration <= 1200) {
-                durationBuckets["601–1200 seconds"]++;
+                durationBuckets[
+                  "601–1200 seconds"
+                ]++;
               } else if (duration <= 1800) {
-                durationBuckets["1201–1800 seconds"]++;
+                durationBuckets[
+                  "1201–1800 seconds"
+                ]++;
               } else {
-                durationBuckets["Over 1800 seconds"]++;
+                durationBuckets[
+                  "Over 1800 seconds"
+                ]++;
               }
             }
           }
 
-          // Identify busiest UTC publishing hours and days.
-          const hourCounts: Record<string, number> = {};
-          const dayCounts: Record<string, number> = {};
+          const hourCounts: Record<
+            string,
+            number
+          > = {};
+
+          const dayCounts: Record<
+            string,
+            number
+          > = {};
 
           const dayNames = [
             "Sunday",
@@ -2048,41 +2305,62 @@ function createServer() {
               video.publishedHourUTC
             ).padStart(2, "0");
 
-            hourCounts[`${hour}:00 UTC`] =
-              (hourCounts[`${hour}:00 UTC`] ?? 0) + 1;
+            const hourLabel =
+              `${hour}:00 UTC`;
 
-            const day = dayNames[video.publishedDayUTC];
+            hourCounts[hourLabel] =
+              (hourCounts[hourLabel] ?? 0) + 1;
+
+            const day =
+              dayNames[video.publishedDayUTC];
 
             dayCounts[day] =
               (dayCounts[day] ?? 0) + 1;
           }
 
-          const busiestHours = Object.entries(hourCounts)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 5)
-            .map(([hour, count]) => ({
-              hour,
-              uploads: count,
-            }));
+          const busiestHours =
+            Object.entries(hourCounts)
+              .sort(
+                (a, b) => b[1] - a[1]
+              )
+              .slice(0, 5)
+              .map(([hour, count]) => ({
+                hour,
+                uploads: count,
+              }));
 
-          const busiestDays = Object.entries(dayCounts)
-            .sort((a, b) => b[1] - a[1])
-            .map(([day, count]) => ({
-              day,
-              uploads: count,
-            }));
+          const busiestDays =
+            Object.entries(dayCounts)
+              .sort(
+                (a, b) => b[1] - a[1]
+              )
+              .map(([day, count]) => ({
+                day,
+                uploads: count,
+              }));
 
-          // Top videos by public view count.
           const topVideos = [...videos]
-            .sort((a, b) => b.views - a.views)
+            .sort(
+              (a, b) => b.views - a.views
+            )
             .slice(0, 10)
             .map((video) => ({
               title: video.title,
-              channelTitle: video.channelTitle,
-              subscribers: video.subscribers,
+              channelTitle:
+                video.channelTitle,
+              subscribers:
+                video.subscribers,
               views: video.views,
-              durationSeconds: video.durationSeconds,
-              publishedAt: video.publishedAt,
+              durationSeconds:
+                video.durationSeconds,
+              publishedAt:
+                video.publishedAt,
+              relevanceScore:
+                video.relevanceScore,
+              matchedQueryTerms:
+                video.matchedQueryTerms,
+              matchedRelatedTerms:
+                video.matchedRelatedTerms,
               engagementRate:
                 video.engagementRate === null
                   ? null
@@ -2097,8 +2375,10 @@ function createServer() {
             format: formatName,
             videosAnalyzed: videos.length,
             totalViews,
-            averageViews: Math.round(averageViews),
-            medianViews: median(viewValues),
+            averageViews:
+              Math.round(averageViews),
+            medianViews:
+              median(viewValues),
             averageEngagementRate:
               averageEngagementRate === null
                 ? null
@@ -2107,13 +2387,15 @@ function createServer() {
                   ) / 100,
             videosWithEngagementData:
               engagementValues.length,
-            averageDurationSeconds: Math.round(
-              durations.reduce(
-                (sum, value) => sum + value,
-                0
-              ) / durations.length
-            ),
-            medianDurationSeconds: median(durations),
+            averageDurationSeconds:
+              Math.round(
+                durations.reduce(
+                  (sum, value) => sum + value,
+                  0
+                ) / durations.length
+              ),
+            medianDurationSeconds:
+              median(durations),
             titlePatterns: {
               questionTitles: {
                 count: questionTitleCount,
@@ -2136,22 +2418,29 @@ function createServer() {
                   videos.length
                 ),
               },
-              recurringWords: recurringTitleWords,
+              recurringWords:
+                recurringTitleWords,
             },
-            durationDistribution: durationBuckets,
+            durationDistribution:
+              durationBuckets,
             publishingPatterns: {
-              busiestHoursUTC: busiestHours,
-              busiestDaysUTC: busiestDays,
+              busiestHoursUTC:
+                busiestHours,
+              busiestDaysUTC:
+                busiestDays,
             },
             topVideos,
           };
         };
 
         // --------------------------------------------------
-        // 7. BUILD FORMAT-SPECIFIC REPORTS
+        // 8. BUILD FORMAT-SPECIFIC REPORTS
         // --------------------------------------------------
 
-        const reports: Record<string, unknown> = {};
+        const reports: Record<
+          string,
+          unknown
+        > = {};
 
         if (
           contentType === "shorts" ||
@@ -2174,7 +2463,7 @@ function createServer() {
         }
 
         // --------------------------------------------------
-        // 8. RETURN COMPETITOR DISCOVERY AND ANALYSIS
+        // 9. RETURN RESULTS
         // --------------------------------------------------
 
         return {
@@ -2183,17 +2472,24 @@ function createServer() {
               type: "text" as const,
               text: JSON.stringify(
                 {
-                  tool: "youtube_content_pattern_detector",
-                  version: "0.8.0",
+                  tool:
+                    "youtube_content_pattern_detector",
+                  version: "0.9.0",
                   searchTopic: query,
+
                   filters: {
-                    maximumSubscribers: maxSubscribers,
-                    maximumCompetitors: maxCompetitors,
+                    maximumSubscribers:
+                      maxSubscribers,
+                    maximumCompetitors:
+                      maxCompetitors,
                     contentType,
                     maximumVideosPerChannel:
                       maxVideosPerChannel,
                     minimumAgeDays,
+                    lookbackDays,
+                    minimumRelevanceScore,
                   },
+
                   discovery: {
                     searchResultsRetrieved:
                       searchItems.length,
@@ -2207,34 +2503,52 @@ function createServer() {
                       videosByChannel.length,
                     eligibleVideosAnalyzed:
                       allVideos.length,
+                    videosExcludedByAge,
+                    videosExcludedByRelevance,
+                    videosExcludedMissingDate,
+                    totalVideosExcluded:
+                      videosExcludedByAge +
+                      videosExcludedByRelevance +
+                      videosExcludedMissingDate,
                   },
-                  competitors: videosByChannel.map(
-                    (channel) => ({
-                      channelTitle: channel.channelTitle,
-                      channelId: channel.channelId,
-                      subscribers: channel.subscribers,
-                      eligibleVideos:
-                        channel.videos.length,
-                      channelUrl:
-                        `https://www.youtube.com/channel/${channel.channelId}`,
-                    })
-                  ),
+
+                  competitors:
+                    videosByChannel.map(
+                      (channel) => ({
+                        channelTitle:
+                          channel.channelTitle,
+                        channelId:
+                          channel.channelId,
+                        subscribers:
+                          channel.subscribers,
+                        eligibleVideos:
+                          channel.videos.length,
+                        channelUrl:
+                          `https://www.youtube.com/channel/${channel.channelId}`,
+                      })
+                    ),
+
                   reports,
+
                   researchNotes: [
-                    "Competitors are automatically discovered using the supplied search topic. The query is the discovery search term, not a guaranteed classification of a channel's entire niche.",
-                    "The search is sorted by public view count. This can favor channels whose videos are already popular and does not represent a complete or unbiased sample of the niche.",
+                    "Competitors are discovered from recent search results matching the supplied query.",
+                    "The query discovers candidate channels; it does not prove that every channel specializes in the topic.",
+                    "Video relevance is estimated using keyword matches in titles and descriptions. It is not a semantic AI classification.",
+                    "Related vocabulary is used to recognize relevant alternative wording.",
+                    "Videos below the configured relevance score are excluded from pattern analysis.",
+                    "Only videos inside the configured lookback period and above the minimum age are analyzed.",
+                    "The search is sorted by public view count and may favor already popular videos.",
                     "Only channels with publicly visible subscriber counts at or below the configured limit are included.",
-                    "The detector analyzes recent uploads from each selected channel's public uploads playlist.",
-                    "Videos younger than the minimum age are excluded from pattern analysis.",
-                    "Shorts and long-form videos are analyzed separately and are never mixed in the reports.",
-                    "Videos of 180 seconds or less are treated as potential Shorts. The YouTube Data API does not provide aspect ratio here, so this is not definitive Shorts classification.",
-                    "Engagement rate is calculated only when views, likes, and comments are publicly available. It is calculated as (likes + comments) divided by views, multiplied by 100.",
-                    "Publishing hours and days are calculated in UTC, not the viewer's local timezone.",
-                    "Title patterns are simple text indicators, not proof that a title structure caused higher views.",
-                    "Top videos are ranked by public view count, not by subscriber-adjusted performance.",
+                    "Shorts and long-form videos are reported separately.",
+                    "Videos of 180 seconds or less are treated as potential Shorts. Aspect ratio is not available from this API response, so classification is not definitive.",
+                    "Engagement rate is calculated only when views, likes, and comments are publicly available.",
+                    "Average views can be distorted by viral videos. Median views are also provided to show a more typical result.",
+                    "Publishing hours and days are calculated in UTC.",
+                    "Title patterns are descriptive indicators, not proof that a title structure caused higher views.",
+                    "Top videos are ranked by public view count, not subscriber-adjusted performance.",
                     "This tool does not inspect actual video footage, audio, or thumbnail image content.",
                     "Public view counts and channel statistics can change over time.",
-                    "The number of videos analyzed may be lower than requested if a channel has fewer recent uploads or some videos are unavailable.",
+                    "The number of analyzed videos may be lower than requested if uploads are unavailable or do not pass the filters.",
                   ],
                 },
                 null,
@@ -2252,6 +2566,7 @@ function createServer() {
       }
     }
   );
+
 
   return server;
 }
