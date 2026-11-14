@@ -26,7 +26,7 @@ const dateSchema = z.string().regex(
 function createServer() {
   const server = new McpServer({
     name: "TubePilot AI",
-    version: "0.7.0",
+    version: "0.8.0",
   });
 
   const props = getMcpAuthContext()?.props as
@@ -1567,6 +1567,626 @@ function createServer() {
                 ? error.message
                 : "Unable to analyze the video for outlier performance.",
             },
+          ],
+        };
+      }
+    },
+  );
+	
+  // Tool 8: Universal Shorts and long-form content pattern detector.
+  server.registerTool(
+    "youtube_content_pattern_detector",
+    {
+      description:
+        "Analyze public YouTube uploads to discover recurring content patterns. Choose shorts, long_form, or both. Reports format-specific performance, title structures, duration, publishing times, engagement and example videos. Shorts and long-form are always analyzed separately. Shorts are duration-based candidates because aspect ratio is not provided by the API.",
+      inputSchema: z.object({
+        channelIds: z.array(z.string().min(1)).min(1).max(10),
+        contentType: z.enum(["shorts", "long_form", "both"]).default("both"),
+        maxVideosPerChannel: z.number().int().min(5).max(50).default(30),
+        minimumAgeDays: z.number().int().min(0).max(365).default(7),
+        niche: z.string().max(100).optional(),
+      }),
+    },
+    async ({
+      channelIds,
+      contentType,
+      maxVideosPerChannel,
+      minimumAgeDays,
+      niche,
+    }) => {
+      try {
+        const accessToken = await getGoogleAccessToken();
+        const headers = {
+          Authorization: `Bearer ${accessToken}`,
+        };
+
+        const uniqueChannelIds = [...new Set(channelIds)];
+        const now = Date.now();
+        const minimumAgeMs =
+          minimumAgeDays * 24 * 60 * 60 * 1000;
+
+        // Retrieve channel information and uploads playlist IDs.
+        const channelsUrl = new URL(
+          "https://www.googleapis.com/youtube/v3/channels",
+        );
+
+        channelsUrl.searchParams.set(
+          "part",
+          "snippet,contentDetails,statistics",
+        );
+        channelsUrl.searchParams.set(
+          "id",
+          uniqueChannelIds.join(","),
+        );
+
+        const channelsResponse = await fetch(
+          channelsUrl.toString(),
+          { headers },
+        );
+
+        if (!channelsResponse.ok) {
+          throw new Error(
+            `Channels API returned ${channelsResponse.status}: ${await channelsResponse.text()}`,
+          );
+        }
+
+        const channelsData = await channelsResponse.json() as {
+          items?: Array<{
+            id: string;
+            snippet?: { title?: string };
+            contentDetails?: {
+              relatedPlaylists?: { uploads?: string };
+            };
+            statistics?: {
+              subscriberCount?: string;
+              hiddenSubscriberCount?: boolean;
+            };
+          }>;
+        };
+
+        const channelMap = new Map(
+          (channelsData.items || []).map((channel) => [
+            channel.id,
+            channel,
+          ]),
+        );
+
+        const missingChannelIds = uniqueChannelIds.filter(
+          (id) => !channelMap.has(id),
+        );
+
+        // Retrieve recent public uploads for each channel.
+        const channelUploads = await Promise.all(
+          uniqueChannelIds.map(async (channelId) => {
+            const channel = channelMap.get(channelId);
+
+            if (!channel) {
+              return {
+                channelId,
+                channelTitle: null,
+                subscriberCount: null,
+                uploads: [] as string[],
+                error: "Channel not found or unavailable.",
+              };
+            }
+
+            const playlistId =
+              channel.contentDetails?.relatedPlaylists?.uploads;
+
+            if (!playlistId) {
+              return {
+                channelId,
+                channelTitle: channel.snippet?.title || null,
+                subscriberCount: null,
+                uploads: [] as string[],
+                error: "Uploads playlist unavailable.",
+              };
+            }
+
+            const playlistUrl = new URL(
+              "https://www.googleapis.com/youtube/v3/playlistItems",
+            );
+
+            playlistUrl.searchParams.set(
+              "part",
+              "contentDetails",
+            );
+            playlistUrl.searchParams.set(
+              "playlistId",
+              playlistId,
+            );
+            playlistUrl.searchParams.set(
+              "maxResults",
+              String(maxVideosPerChannel),
+            );
+
+            const playlistResponse = await fetch(
+              playlistUrl.toString(),
+              { headers },
+            );
+
+            if (!playlistResponse.ok) {
+              throw new Error(
+                `Playlist API returned ${playlistResponse.status} for ${channelId}: ${await playlistResponse.text()}`,
+              );
+            }
+
+            const playlistData = await playlistResponse.json() as {
+              items?: Array<{
+                contentDetails?: { videoId?: string };
+              }>;
+            };
+
+            return {
+              channelId,
+              channelTitle: channel.snippet?.title || null,
+              subscriberCount:
+                channel.statistics?.subscriberCount !== undefined
+                  ? Number(channel.statistics.subscriberCount)
+                  : null,
+              uploads: (playlistData.items || [])
+                .map((item) => item.contentDetails?.videoId || "")
+                .filter(Boolean),
+              error: null,
+            };
+          }),
+        );
+
+        const allVideoIds = [
+          ...new Set(
+            channelUploads.flatMap((channel) => channel.uploads),
+          ),
+        ];
+
+        // Retrieve video details in batches of 50.
+        const videoMap = new Map<
+          string,
+          {
+            videoId: string;
+            title: string;
+            description: string;
+            publishedAt: string;
+            durationSeconds: number;
+            views: number;
+            likes: number | null;
+            comments: number | null;
+            thumbnail: string | null;
+            videoUrl: string;
+          }
+        >();
+
+        for (let i = 0; i < allVideoIds.length; i += 50) {
+          const batch = allVideoIds.slice(i, i + 50);
+
+          const videosUrl = new URL(
+            "https://www.googleapis.com/youtube/v3/videos",
+          );
+
+          videosUrl.searchParams.set(
+            "part",
+            "snippet,statistics,contentDetails",
+          );
+          videosUrl.searchParams.set("id", batch.join(","));
+
+          const videosResponse = await fetch(
+            videosUrl.toString(),
+            { headers },
+          );
+
+          if (!videosResponse.ok) {
+            throw new Error(
+              `Videos API returned ${videosResponse.status}: ${await videosResponse.text()}`,
+            );
+          }
+
+          const videosData = await videosResponse.json() as {
+            items?: Array<{
+              id: string;
+              snippet: {
+                title: string;
+                description: string;
+                publishedAt: string;
+                thumbnails?: {
+                  high?: { url: string };
+                  medium?: { url: string };
+                  default?: { url: string };
+                };
+              };
+              statistics?: {
+                viewCount?: string;
+                likeCount?: string;
+                commentCount?: string;
+              };
+              contentDetails?: {
+                duration?: string;
+              };
+            }>;
+          };
+
+          for (const video of videosData.items || []) {
+            const durationSeconds = durationToSeconds(
+              video.contentDetails?.duration || "",
+            );
+
+            videoMap.set(video.id, {
+              videoId: video.id,
+              title: video.snippet.title,
+              description: video.snippet.description,
+              publishedAt: video.snippet.publishedAt,
+              durationSeconds,
+              views: Number(video.statistics?.viewCount || 0),
+              likes: video.statistics?.likeCount !== undefined
+                ? Number(video.statistics.likeCount)
+                : null,
+              comments: video.statistics?.commentCount !== undefined
+                ? Number(video.statistics.commentCount)
+                : null,
+              thumbnail:
+                video.snippet.thumbnails?.high?.url ||
+                video.snippet.thumbnails?.medium?.url ||
+                video.snippet.thumbnails?.default?.url ||
+                null,
+              videoUrl:
+                `https://www.youtube.com/watch?v=${video.id}`,
+            });
+          }
+        }
+
+        // Build a video collection for each channel.
+        const videosByChannel = channelUploads.map((channel) => {
+          const videos = channel.uploads
+            .map((id) => videoMap.get(id))
+            .filter((video) => video !== undefined)
+            .filter((video) => {
+              const publishedTime = new Date(
+                video.publishedAt,
+              ).getTime();
+
+              return (
+                Number.isFinite(publishedTime) &&
+                now - publishedTime >= minimumAgeMs
+              );
+            })
+            .map((video) => ({
+              ...video,
+              ageDays: Math.floor(
+                (now - new Date(video.publishedAt).getTime()) /
+                  (24 * 60 * 60 * 1000),
+              ),
+              formatCandidate:
+                video.durationSeconds <= 180
+                  ? "Potential Short — verify aspect ratio"
+                  : "Long-form candidate",
+            }));
+
+          return {
+            channelId: channel.channelId,
+            channelTitle: channel.channelTitle,
+            subscriberCount: channel.subscriberCount,
+            error: channel.error,
+            videos,
+          };
+        });
+
+        // Aggregate patterns separately for each requested format.
+        function analyzeFormat(
+          format: "shorts" | "long_form",
+        ) {
+          const selectedVideos = videosByChannel.flatMap(
+            (channel) =>
+              channel.videos
+                .filter((video) =>
+                  format === "shorts"
+                    ? video.durationSeconds <= 180
+                    : video.durationSeconds > 180,
+                )
+                .map((video) => ({
+                  ...video,
+                  channelId: channel.channelId,
+                  channelTitle: channel.channelTitle,
+                })),
+          );
+
+          const sortedViews = selectedVideos
+            .map((video) => video.views)
+            .sort((a, b) => a - b);
+
+          const medianViews = median(sortedViews);
+
+          const averageViews = selectedVideos.length
+            ? Math.round(
+                sortedViews.reduce((sum, value) => sum + value, 0) /
+                  sortedViews.length,
+              )
+            : null;
+
+          const durationMedian = median(
+            selectedVideos.map((video) => video.durationSeconds),
+          );
+
+          const titleWords = new Map<string, number>();
+          let questionTitles = 0;
+          let hashtagTitles = 0;
+          let titlesWithNumbers = 0;
+
+          const publishingHours = new Map<number, number>();
+          const publishingDays = new Map<string, number>();
+
+          const dayNames = [
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+          ];
+
+          let totalEngagementRate = 0;
+          let engagementVideoCount = 0;
+
+          for (const video of selectedVideos) {
+            const normalizedTitle = video.title
+              .toLowerCase()
+              .replace(/https?:\/\/\S+/g, " ")
+              .replace(/[^a-z0-9#'\s]/g, " ");
+
+            const words = normalizedTitle
+              .split(/\s+/)
+              .filter((word) => word.length >= 3)
+              .filter((word) => ![
+                "the", "and", "for", "you", "your",
+                "with", "this", "that", "can", "are",
+                "how", "what", "why", "only", "from",
+                "shorts",
+              ].includes(word));
+
+            for (const word of new Set(words)) {
+              titleWords.set(
+                word,
+                (titleWords.get(word) || 0) + 1,
+              );
+            }
+
+            if (video.title.includes("?")) questionTitles++;
+            if (video.title.includes("#")) hashtagTitles++;
+            if (/\d/.test(video.title)) titlesWithNumbers++;
+
+            const publishedDate = new Date(video.publishedAt);
+
+            if (Number.isFinite(publishedDate.getTime())) {
+              const hour = publishedDate.getUTCHours();
+              const day = dayNames[publishedDate.getUTCDay()];
+
+              publishingHours.set(
+                hour,
+                (publishingHours.get(hour) || 0) + 1,
+              );
+
+              publishingDays.set(
+                day,
+                (publishingDays.get(day) || 0) + 1,
+              );
+            }
+
+            if (
+              video.likes !== null &&
+              video.views > 0
+            ) {
+              const engagement =
+                ((video.likes + (video.comments || 0)) /
+                  video.views) * 100;
+
+              totalEngagementRate += engagement;
+              engagementVideoCount++;
+            }
+          }
+
+          const count = selectedVideos.length;
+
+          const percentage = (value: number) =>
+            count > 0
+              ? Number(((value / count) * 100).toFixed(1))
+              : null;
+
+          const topEntries = (
+            map: Map<string | number, number>,
+            limit: number,
+          ) =>
+            [...map.entries()]
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, limit)
+              .map(([value, occurrences]) => ({
+                value,
+                occurrences,
+              }));
+
+          const durationBuckets = format === "shorts"
+            ? [
+                { label: "0–15 seconds", min: 0, max: 15 },
+                { label: "16–30 seconds", min: 16, max: 30 },
+                { label: "31–60 seconds", min: 31, max: 60 },
+                { label: "61–180 seconds", min: 61, max: 180 },
+              ]
+            : [
+                { label: "3–5 minutes", min: 181, max: 300 },
+                { label: "5–10 minutes", min: 301, max: 600 },
+                { label: "10–20 minutes", min: 601, max: 1200 },
+                { label: "20–40 minutes", min: 1201, max: 2400 },
+                { label: "Over 40 minutes", min: 2401, max: Infinity },
+              ];
+
+          const durationDistribution = durationBuckets.map(
+            (bucket) => {
+              const matching = selectedVideos.filter(
+                (video) =>
+                  video.durationSeconds >= bucket.min &&
+                  video.durationSeconds <= bucket.max,
+              );
+
+              return {
+                durationRange: bucket.label,
+                videoCount: matching.length,
+                percentage: percentage(matching.length),
+                medianViews: median(
+                  matching.map((video) => video.views),
+                ),
+              };
+            },
+          );
+
+          const topVideos = [...selectedVideos]
+            .sort((a, b) => b.views - a.views)
+            .slice(0, 10);
+
+          return {
+            format,
+            classification:
+              format === "shorts"
+                ? "Potential Shorts: duration at or below 180 seconds. Aspect ratio is not verified."
+                : "Long-form candidates: duration above 180 seconds.",
+            videosAnalyzed: count,
+            channelCount: new Set(
+              selectedVideos.map((video) => video.channelId),
+            ).size,
+            performance: {
+              medianViews,
+              averageViews,
+              totalViews: selectedVideos.reduce(
+                (sum, video) => sum + video.views,
+                0,
+              ),
+              averageEngagementRatePercent:
+                engagementVideoCount > 0
+                  ? Number(
+                      (
+                        totalEngagementRate /
+                        engagementVideoCount
+                      ).toFixed(2),
+                    )
+                  : null,
+              engagementNote:
+                "Engagement rate is calculated as (likes + comments) / views. It is not a measure of watch retention.",
+            },
+            titlePatterns: {
+              questionTitles: {
+                count: questionTitles,
+                percentage: percentage(questionTitles),
+              },
+              hashtagTitles: {
+                count: hashtagTitles,
+                percentage: percentage(hashtagTitles),
+              },
+              titlesWithNumbers: {
+                count: titlesWithNumbers,
+                percentage: percentage(titlesWithNumbers),
+              },
+              recurringWords: topEntries(titleWords, 15),
+            },
+            durationPatterns: {
+              medianDurationSeconds: durationMedian,
+              distribution: durationDistribution,
+            },
+            publishingPatterns: {
+              busiestUtcHours: topEntries(
+                publishingHours,
+                5,
+              ),
+              busiestUtcDays: topEntries(
+                publishingDays,
+                7,
+              ),
+              timezone: "UTC",
+            },
+            topVideos: topVideos.map((video) => ({
+              videoId: video.videoId,
+              title: video.title,
+              channelTitle: video.channelTitle,
+              publishedAt: video.publishedAt,
+              ageDays: video.ageDays,
+              durationSeconds: video.durationSeconds,
+              views: video.views,
+              likes: video.likes,
+              comments: video.comments,
+              videoUrl: video.videoUrl,
+              thumbnail: video.thumbnail,
+            })),
+            evidenceLimitations: [
+              "Patterns are descriptive observations, not proof that a title or publishing time caused higher views.",
+              "Views are lifetime public view counts, not views measured at a fixed age.",
+              "The API does not provide reliable thumbnail image analysis or verified aspect ratio in this tool.",
+              "A duration of 180 seconds or less is a potential Short classification only.",
+              "Publishing times are reported in UTC.",
+            ],
+          };
+        }
+
+        const reports: Record<string, unknown> = {};
+
+        if (contentType === "shorts" || contentType === "both") {
+          reports.shorts = analyzeFormat("shorts");
+        }
+
+        if (
+          contentType === "long_form" ||
+          contentType === "both"
+        ) {
+          reports.longForm = analyzeFormat("long_form");
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  source: "YouTube Data API v3",
+                  tool: "TubePilot Universal Content Pattern Detector",
+                  version: "0.8.0",
+                  contentType,
+                  niche: niche || null,
+                  requestedChannels: uniqueChannelIds.length,
+                  channelsFound: channelUploads.filter(
+                    (channel) => !channel.error,
+                  ).length,
+                  missingChannelIds,
+                  maxVideosPerChannel,
+                  minimumAgeDays,
+                  channelSummary: videosByChannel.map((channel) => ({
+                    channelId: channel.channelId,
+                    channelTitle: channel.channelTitle,
+                    subscriberCount: channel.subscriberCount,
+                    videosAnalyzed: channel.videos.length,
+                    error: channel.error,
+                  })),
+                  reports,
+                  notes: [
+                    "Shorts and long-form are analyzed independently and are never mixed in the same performance baseline.",
+                    "The shorts classification is based on duration only and does not verify aspect ratio.",
+                    "The tool analyzes recent public uploads, not private analytics.",
+                    "The niche field provides research context; it does not filter videos automatically.",
+                    "A minimum age of zero includes newly published uploads.",
+                    "Small sample sizes can produce unstable patterns. Interpret findings using the number of videos analyzed.",
+                  ],
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        console.error("Content pattern detector error:", error);
+
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: error instanceof Error
+                ? error.message
+                : "Unable to analyze YouTube content patterns.",
+            ],
           ],
         };
       }
