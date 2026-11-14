@@ -1087,10 +1087,12 @@ function createServer() {
     },
   );
   // TOOL 7: YOUTUBE VIDEO OUTLIER DETECTOR
-  server.tool(
-    "youtube_video_outlier_detector",
-    "Check whether a YouTube video is outperforming its own channel baseline. Compares the target against older, mature uploads of the same duration-based format. Uses median views and reports sample-size confidence.",
-    {
+  server.registerTool(
+  "youtube_video_outlier_detector",
+  {
+    description:
+      "Check whether a YouTube video is outperforming its own channel baseline. Compares the target against older, mature uploads of the same duration-based format. Uses median views and reports sample-size confidence.",
+    inputSchema: z.object({
       videoId: z
         .string()
         .min(6)
@@ -1112,8 +1114,9 @@ function createServer() {
         .max(50)
         .default(30)
         .describe("Maximum number of comparable uploads to analyze"),
-    },
-    async ({ videoId, minimumAgeDays, maxComparableVideos }) => {
+        }),
+  },
+  async ({ videoId, minimumAgeDays, maxComparableVideos }) => {
       try {
         const accessToken = await getGoogleAccessToken();
 
@@ -1449,10 +1452,12 @@ function createServer() {
     }
   );
   // TOOL 8: UNIVERSAL CONTENT PATTERN DETECTOR
-  server.tool(
-    "youtube_content_pattern_detector",
-    "Automatically discover small YouTube competitors from a search topic, analyze their recent public uploads, and identify separate Shorts and long-form content patterns.",
-    {
+  server.registerTool(
+  "youtube_content_pattern_detector",
+  {
+    description:
+      "Automatically discover small YouTube competitors from a search topic, analyze their recent public uploads, and identify separate Shorts and long-form content patterns.",
+    inputSchema: z.object({
       query: z
         .string()
         .min(2)
@@ -1496,15 +1501,16 @@ function createServer() {
         .max(365)
         .default(7)
         .describe("Minimum video age in days for pattern analysis"),
-    },
-    async ({
-      query,
-      maxSubscribers,
-      maxCompetitors,
-      contentType,
-      maxVideosPerChannel,
-      minimumAgeDays,
-    }) => {
+        }),
+  },
+  async ({
+    query,
+    maxSubscribers,
+    maxCompetitors,
+    contentType,
+    maxVideosPerChannel,
+    minimumAgeDays,
+  }) => {
       try {
         const accessToken = await getGoogleAccessToken();
 
