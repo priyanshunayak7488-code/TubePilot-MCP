@@ -26,7 +26,7 @@ const dateSchema = z.string().regex(
 function createServer() {
   const server = new McpServer({
     name: "TubePilot AI",
-    version: "0.6.0",
+    version: "0.7.0",
   });
 
   const props = getMcpAuthContext()?.props as
@@ -690,15 +690,16 @@ function createServer() {
     async ({ channelIds, maxUploadsPerChannel, minimumAgeDays }) => {
       try {
         const uniqueChannelIds = [...new Set(channelIds)];
-
         const accessToken = await getGoogleAccessToken();
 
-        // Step 1: Retrieve channel upload playlist IDs.
         const channelsUrl = new URL(
           "https://www.googleapis.com/youtube/v3/channels",
         );
 
-        channelsUrl.searchParams.set("part", "snippet,contentDetails,statistics");
+        channelsUrl.searchParams.set(
+          "part",
+          "snippet,contentDetails,statistics",
+        );
         channelsUrl.searchParams.set(
           "id",
           uniqueChannelIds.join(","),
@@ -745,7 +746,6 @@ function createServer() {
           (id) => !channelMap.has(id),
         );
 
-        // Step 2: Retrieve recent uploads from each channel.
         const channelResults = await Promise.all(
           uniqueChannelIds.map(async (channelId) => {
             const channel = channelMap.get(channelId);
@@ -788,7 +788,10 @@ function createServer() {
               "https://www.googleapis.com/youtube/v3/playlistItems",
             );
 
-            playlistUrl.searchParams.set("part", "contentDetails,snippet");
+            playlistUrl.searchParams.set(
+              "part",
+              "contentDetails,snippet",
+            );
             playlistUrl.searchParams.set(
               "playlistId",
               uploadsPlaylistId,
@@ -855,7 +858,6 @@ function createServer() {
           }),
         );
 
-        // Step 3: Collect video IDs and retrieve video details in batches.
         const allVideoIds = [
           ...new Set(
             channelResults.flatMap((channel) =>
@@ -961,9 +963,9 @@ function createServer() {
           }
         }
 
-        // Step 4: Build channel histories and separate baselines.
         const now = Date.now();
-        const minimumAgeMs = minimumAgeDays * 24 * 60 * 60 * 1000;
+        const minimumAgeMs =
+          minimumAgeDays * 24 * 60 * 60 * 1000;
 
         const results = channelResults.map((channel) => {
           const uploads = channel.uploads
@@ -971,7 +973,9 @@ function createServer() {
               const video = videoMap.get(upload.videoId);
               if (!video) return null;
 
-              const ageMs = now - new Date(video.publishedAt).getTime();
+              const ageMs =
+                now - new Date(video.publishedAt).getTime();
+
               const ageDays = Math.max(
                 0,
                 Math.floor(ageMs / (24 * 60 * 60 * 1000)),
@@ -1084,6 +1088,484 @@ function createServer() {
               text: error instanceof Error
                 ? error.message
                 : "Unable to retrieve channel upload history.",
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // Tool 7: Public YouTube outlier detector.
+  server.registerTool(
+    "youtube_video_outlier_detector",
+    {
+      description:
+        "Analyze a public YouTube video against earlier uploads from the same channel. Excludes the target video, compares matching potential Shorts or long-form candidates, and calculates a views-to-median multiplier with sample-size confidence.",
+      inputSchema: z.object({
+        targetVideoId: z.string().min(1).max(20),
+        maxBaselineUploads: z.number().int().min(5).max(50).default(30),
+        minimumAgeDays: z.number().int().min(1).max(90).default(7),
+        outlierThreshold: z.number().min(1).max(100).default(3),
+      }),
+    },
+    async ({
+      targetVideoId,
+      maxBaselineUploads,
+      minimumAgeDays,
+      outlierThreshold,
+    }) => {
+      try {
+        const accessToken = await getGoogleAccessToken();
+        const headers = {
+          Authorization: `Bearer ${accessToken}`,
+        };
+
+        // Step 1: Retrieve target video details.
+        const targetUrl = new URL(
+          "https://www.googleapis.com/youtube/v3/videos",
+        );
+
+        targetUrl.searchParams.set(
+          "part",
+          "snippet,statistics,contentDetails",
+        );
+        targetUrl.searchParams.set("id", targetVideoId);
+
+        const targetResponse = await fetch(targetUrl.toString(), {
+          headers,
+        });
+
+        if (!targetResponse.ok) {
+          throw new Error(
+            `Target video request failed (${targetResponse.status}): ${await targetResponse.text()}`,
+          );
+        }
+
+        const targetData = await targetResponse.json() as {
+          items?: Array<{
+            id: string;
+            snippet: {
+              title: string;
+              channelId: string;
+              channelTitle: string;
+              publishedAt: string;
+            };
+            statistics?: {
+              viewCount?: string;
+              likeCount?: string;
+              commentCount?: string;
+            };
+            contentDetails?: {
+              duration?: string;
+            };
+          }>;
+        };
+
+        const target = targetData.items?.[0];
+
+        if (!target) {
+          throw new Error(
+            "Target video was not found or is not publicly available.",
+          );
+        }
+
+        const targetDurationSeconds = durationToSeconds(
+          target.contentDetails?.duration || "",
+        );
+
+        const targetIsPotentialShort =
+          targetDurationSeconds <= 180;
+
+        const targetViews = Number(
+          target.statistics?.viewCount || 0,
+        );
+
+        const targetPublishedAt = new Date(
+          target.snippet.publishedAt,
+        );
+
+        if (
+          !Number.isFinite(targetPublishedAt.getTime()) ||
+          !Number.isFinite(targetViews)
+        ) {
+          throw new Error("Target video data is invalid.");
+        }
+
+        // Step 2: Retrieve the channel's uploads playlist.
+        const channelUrl = new URL(
+          "https://www.googleapis.com/youtube/v3/channels",
+        );
+
+        channelUrl.searchParams.set("part", "contentDetails");
+        channelUrl.searchParams.set("id", target.snippet.channelId);
+
+        const channelResponse = await fetch(channelUrl.toString(), {
+          headers,
+        });
+
+        if (!channelResponse.ok) {
+          throw new Error(
+            `Channel request failed (${channelResponse.status}): ${await channelResponse.text()}`,
+          );
+        }
+
+        const channelData = await channelResponse.json() as {
+          items?: Array<{
+            contentDetails?: {
+              relatedPlaylists?: {
+                uploads?: string;
+              };
+            };
+          }>;
+        };
+
+        const uploadsPlaylistId =
+          channelData.items?.[0]?.contentDetails
+            ?.relatedPlaylists?.uploads;
+
+        if (!uploadsPlaylistId) {
+          throw new Error(
+            "Could not retrieve the channel's public uploads playlist.",
+          );
+        }
+
+        // Step 3: Page through uploads until the target is found.
+        // YouTube allows a maximum of 50 playlist items per request.
+        // The playlist is ordered newest to oldest.
+        const baselineVideos: Array<{
+          id: string;
+          title: string;
+          publishedAt: string;
+          durationSeconds: number;
+          views: number;
+        }> = [];
+
+        let pageToken: string | undefined;
+        let targetFound = false;
+        let pagesScanned = 0;
+
+        const maximumPages = 20;
+        const minimumAgeMs =
+          minimumAgeDays * 24 * 60 * 60 * 1000;
+        const now = Date.now();
+
+        while (
+          pagesScanned < maximumPages &&
+          baselineVideos.length < maxBaselineUploads
+        ) {
+          const playlistUrl = new URL(
+            "https://www.googleapis.com/youtube/v3/playlistItems",
+          );
+
+          playlistUrl.searchParams.set("part", "contentDetails");
+          playlistUrl.searchParams.set(
+            "playlistId",
+            uploadsPlaylistId,
+          );
+          playlistUrl.searchParams.set("maxResults", "50");
+
+          if (pageToken) {
+            playlistUrl.searchParams.set("pageToken", pageToken);
+          }
+
+          const playlistResponse = await fetch(
+            playlistUrl.toString(),
+            { headers },
+          );
+
+          if (!playlistResponse.ok) {
+            throw new Error(
+              `Uploads playlist request failed (${playlistResponse.status}): ${await playlistResponse.text()}`,
+            );
+          }
+
+          const playlistData = await playlistResponse.json() as {
+            nextPageToken?: string;
+            items?: Array<{
+              contentDetails?: {
+                videoId?: string;
+              };
+            }>;
+          };
+
+          pagesScanned++;
+
+          const pageIds = (playlistData.items || [])
+            .map((item) => item.contentDetails?.videoId)
+            .filter((id): id is string => Boolean(id));
+
+          let olderIds: string[];
+
+          if (!targetFound) {
+            const targetIndex = pageIds.indexOf(targetVideoId);
+
+            if (targetIndex === -1) {
+              olderIds = [];
+            } else {
+              targetFound = true;
+              olderIds = pageIds.slice(targetIndex + 1);
+            }
+          } else {
+            olderIds = pageIds;
+          }
+
+          // Step 4: Retrieve details for older uploads.
+          const uniqueOlderIds = [
+            ...new Set(olderIds),
+          ].filter((id) => id !== targetVideoId);
+
+          for (let i = 0; i < uniqueOlderIds.length; i += 50) {
+            if (baselineVideos.length >= maxBaselineUploads) break;
+
+            const batch = uniqueOlderIds.slice(i, i + 50);
+            if (batch.length === 0) continue;
+
+            const videosUrl = new URL(
+              "https://www.googleapis.com/youtube/v3/videos",
+            );
+
+            videosUrl.searchParams.set(
+              "part",
+              "snippet,statistics,contentDetails",
+            );
+            videosUrl.searchParams.set("id", batch.join(","));
+
+            const videosResponse = await fetch(
+              videosUrl.toString(),
+              { headers },
+            );
+
+            if (!videosResponse.ok) {
+              throw new Error(
+                `History videos request failed (${videosResponse.status}): ${await videosResponse.text()}`,
+              );
+            }
+
+            const videosData = await videosResponse.json() as {
+              items?: Array<{
+                id: string;
+                snippet: {
+                  title: string;
+                  publishedAt: string;
+                };
+                statistics?: {
+                  viewCount?: string;
+                };
+                contentDetails?: {
+                  duration?: string;
+                };
+              }>;
+            };
+
+            for (const video of videosData.items || []) {
+              if (baselineVideos.length >= maxBaselineUploads) break;
+
+              const publishedAt = new Date(
+                video.snippet.publishedAt,
+              ).getTime();
+
+              if (!Number.isFinite(publishedAt)) continue;
+
+              if (publishedAt >= targetPublishedAt.getTime()) {
+                continue;
+              }
+
+              if (now - publishedAt < minimumAgeMs) {
+                continue;
+              }
+
+              const durationSeconds = durationToSeconds(
+                video.contentDetails?.duration || "",
+              );
+
+              const isPotentialShort = durationSeconds <= 180;
+
+              if (isPotentialShort !== targetIsPotentialShort) {
+                continue;
+              }
+
+              baselineVideos.push({
+                id: video.id,
+                title: video.snippet.title,
+                publishedAt: video.snippet.publishedAt,
+                durationSeconds,
+                views: Number(
+                  video.statistics?.viewCount || 0,
+                ),
+              });
+            }
+          }
+
+          if (!playlistData.nextPageToken) break;
+
+          pageToken = playlistData.nextPageToken;
+        }
+
+        if (!targetFound) {
+          throw new Error(
+            `Target video was not found in the channel's uploads playlist within ${maximumPages} pages. The video may not be part of the channel's public upload history.`,
+          );
+        }
+
+        // Step 5: Calculate baseline and confidence.
+        const comparableVideos = baselineVideos.slice(
+          0,
+          maxBaselineUploads,
+        );
+
+        const sampleSize = comparableVideos.length;
+
+        const baselineViews = median(
+          comparableVideos.map((video) => video.views),
+        );
+
+        let confidence:
+          | "Insufficient data"
+          | "Low"
+          | "Medium"
+          | "High";
+
+        if (sampleSize < 5) {
+          confidence = "Insufficient data";
+        } else if (sampleSize <= 9) {
+          confidence = "Low";
+        } else if (sampleSize <= 19) {
+          confidence = "Medium";
+        } else {
+          confidence = "High";
+        }
+
+        // No multiplier or outlier verdict with fewer than five samples.
+        const multiplier =
+          sampleSize >= 5 &&
+          baselineViews !== null &&
+          baselineViews > 0
+            ? Number(
+                (targetViews / baselineViews).toFixed(2),
+              )
+            : null;
+
+        let performanceLabel: string;
+
+        if (sampleSize < 5) {
+          performanceLabel = "Insufficient data";
+        } else if (multiplier === null) {
+          performanceLabel =
+            "Cannot calculate — baseline is zero or unavailable.";
+        } else if (multiplier >= outlierThreshold) {
+          performanceLabel = "Potential outlier";
+        } else if (multiplier > 1) {
+          performanceLabel = "Above channel baseline";
+        } else if (multiplier === 1) {
+          performanceLabel = "At channel baseline";
+        } else {
+          performanceLabel = "Below channel baseline";
+        }
+
+        const targetAgeDays = Math.max(
+          0,
+          Math.floor(
+            (now - targetPublishedAt.getTime()) /
+              (24 * 60 * 60 * 1000),
+          ),
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  source: "YouTube Data API v3",
+                  analysis: "Public channel outlier analysis",
+
+                  channel: {
+                    name: target.snippet.channelTitle,
+                    channelId: target.snippet.channelId,
+                    channelUrl:
+                      `https://www.youtube.com/channel/${target.snippet.channelId}`,
+                  },
+
+                  targetVideo: {
+                    videoId: target.id,
+                    title: target.snippet.title,
+                    publishedAt: target.snippet.publishedAt,
+                    ageDays: targetAgeDays,
+                    durationSeconds: targetDurationSeconds,
+                    formatCandidate: targetIsPotentialShort
+                      ? "Potential Short — verify aspect ratio"
+                      : "Long-form candidate",
+                    views: targetViews,
+                    likes: target.statistics?.likeCount
+                      ? Number(target.statistics.likeCount)
+                      : null,
+                    comments: target.statistics?.commentCount
+                      ? Number(target.statistics.commentCount)
+                      : null,
+                    videoUrl:
+                      `https://www.youtube.com/watch?v=${target.id}`,
+                  },
+
+                  baseline: {
+                    method:
+                      "Median views of earlier, mature uploads from the same channel and format candidate.",
+                    targetExcluded: true,
+                    minimumAgeDays,
+                    requestedMaximum: maxBaselineUploads,
+                    comparableVideosFound: sampleSize,
+                    medianViews: baselineViews,
+                    playlistPagesScanned: pagesScanned,
+                    playlistPageLimit: maximumPages,
+                  },
+
+                  outlierAnalysis: {
+                    targetViews,
+                    baselineMedianViews: baselineViews,
+                    outlierMultiplier: multiplier,
+                    thresholdMultiplier: outlierThreshold,
+                    performanceLabel,
+                    confidence,
+                    confidenceSampleSize: sampleSize,
+                    scoreStatus:
+                      sampleSize < 5
+                        ? "Insufficient comparable uploads. No outlier verdict or multiplier has been issued."
+                        : multiplier === null
+                          ? "Baseline cannot support a multiplier."
+                          : "Multiplier calculated from the available comparable uploads.",
+                  },
+
+                  comparableVideos,
+
+                  notes: [
+                    "The target must be found in the channel's public uploads playlist.",
+                    "The target video is always excluded from its own baseline.",
+                    "Only uploads published before the target are considered.",
+                    "Only uploads at least the requested minimum age are used.",
+                    "Potential Shorts and long-form candidates are compared separately.",
+                    "Duration of 180 seconds or less is only a potential Short classification; aspect ratio is not verified.",
+                    "The outlier threshold is configurable and defaults to 3x the channel median.",
+                    "A confidence label describes sample size, not statistical certainty.",
+                    "The detector scans up to 20 playlist pages to find the target and collect older comparable uploads.",
+                    "The baseline includes up to the requested number of mature comparable uploads.",
+                  ],
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        console.error("Video outlier detector error:", error);
+
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: error instanceof Error
+                ? error.message
+                : "Unable to analyze the video for outlier performance.",
             },
           ],
         };
