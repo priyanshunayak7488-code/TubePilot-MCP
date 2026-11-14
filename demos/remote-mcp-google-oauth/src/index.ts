@@ -1450,38 +1450,7 @@ function createServer() {
         );
       }
     }
-  );
-	
-
-              description,
-              publishedAt,
-              publishedTime:
-                publishedDate.getTime(),
-              publishedHourUTC:
-                publishedDate.getUTCHours(),
-              publishedDayUTC:
-                publishedDate.getUTCDay(),
-              durationSeconds,
-              views,
-              likes,
-              comments,
-              engagementRate,
-              relevanceScore: relevance.score,
-              matchedQueryTerms:
-                relevance.directMatches,
-              matchedRelatedTerms:
-                relevance.relatedMatches,
-              videoUrl:
-                `https://www.youtube.com/watch?v=${video.id}`,
-              thumbnail:
-                video.snippet?.thumbnails?.high?.url ??
-                video.snippet?.thumbnails?.medium?.url ??
-                video.snippet?.thumbnails?.default?.url ??
-                null,
-            });
-          }
-        } 
-     });
+  );	
 
   // TOOL 8: UNIVERSAL CONTENT PATTERN DETECTOR — VERSION 1.0.0
   server.registerTool(
