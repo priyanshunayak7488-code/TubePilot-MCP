@@ -2186,7 +2186,7 @@ function createServer() {
               text: error instanceof Error
                 ? error.message
                 : "Unable to analyze YouTube content patterns.",
-            ],
+						},
           ],
         };
       }
