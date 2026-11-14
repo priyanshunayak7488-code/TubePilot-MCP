@@ -26,7 +26,7 @@ const dateSchema = z.string().regex(
 function createServer() {
   const server = new McpServer({
     name: "TubePilot AI",
-    version: "0.5.0",
+    version: "0.6.0",
   });
 
   const props = getMcpAuthContext()?.props as
@@ -72,6 +72,33 @@ function createServer() {
     }
 
     return tokens.access_token;
+  }
+
+  function durationToSeconds(duration: string): number {
+    const match = duration.match(
+      /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/,
+    );
+
+    if (!match) return 0;
+
+    return (
+      Number(match[1] || 0) * 3600 +
+      Number(match[2] || 0) * 60 +
+      Number(match[3] || 0)
+    );
+  }
+
+  function median(values: number[]): number | null {
+    if (values.length === 0) return null;
+
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+
+    if (sorted.length % 2 === 0) {
+      return (sorted[middle - 1] + sorted[middle]) / 2;
+    }
+
+    return sorted[middle];
   }
 
   // Tool 1: Connection test.
@@ -313,20 +340,6 @@ function createServer() {
           }>;
         };
 
-        function durationToSeconds(duration: string): number {
-          const match = duration.match(
-            /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/,
-          );
-
-          if (!match) return 0;
-
-          return (
-            Number(match[1] || 0) * 3600 +
-            Number(match[2] || 0) * 60 +
-            Number(match[3] || 0)
-          );
-        }
-
         const videos = (data.items || []).map((video) => {
           const durationSeconds = durationToSeconds(
             video.contentDetails.duration,
@@ -348,7 +361,8 @@ function createServer() {
               video.snippet.thumbnails?.medium?.url ||
               video.snippet.thumbnails?.default?.url ||
               null,
-            videoUrl: `https://www.youtube.com/watch?v=${video.id}`,
+            videoUrl:
+              `https://www.youtube.com/watch?v=${video.id}`,
           };
         });
 
@@ -391,7 +405,7 @@ function createServer() {
     },
   );
 
-  // Tool 5: Search public YouTube videos and channel statistics.
+  // Tool 5: Public YouTube video search.
   server.registerTool(
     "youtube_public_video_search",
     {
@@ -408,7 +422,6 @@ function createServer() {
       try {
         const accessToken = await getGoogleAccessToken();
 
-        // Step 1: Search public videos.
         const searchUrl = new URL(
           "https://www.googleapis.com/youtube/v3/search",
         );
@@ -435,11 +448,7 @@ function createServer() {
           items?: Array<{
             id?: { videoId?: string };
             snippet?: {
-              title?: string;
-              description?: string;
-              publishedAt?: string;
               channelId?: string;
-              channelTitle?: string;
             };
           }>;
         };
@@ -477,13 +486,12 @@ function createServer() {
           };
         }
 
-				if (channelIds.length === 0) {
+        if (channelIds.length === 0) {
           throw new Error(
             "Could not retrieve channel IDs for the search results.",
           );
-				}
+        }
 
-        // Step 2: Retrieve public video statistics and durations.
         const videosUrl = new URL(
           "https://www.googleapis.com/youtube/v3/videos",
         );
@@ -532,7 +540,6 @@ function createServer() {
           }>;
         };
 
-        // Step 3: Retrieve public channel subscriber statistics.
         const channelsUrl = new URL(
           "https://www.googleapis.com/youtube/v3/channels",
         );
@@ -555,14 +562,10 @@ function createServer() {
         const channelsData = await channelsResponse.json() as {
           items?: Array<{
             id: string;
-            snippet?: {
-              title?: string;
-            };
             statistics?: {
               subscriberCount?: string;
               hiddenSubscriberCount?: boolean;
               videoCount?: string;
-              viewCount?: string;
             };
           }>;
         };
@@ -574,24 +577,10 @@ function createServer() {
           ]),
         );
 
-        function durationToSeconds(duration: string): number {
-          const match = duration.match(
-            /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/,
-          );
-
-          if (!match) return 0;
-
-          return (
-            Number(match[1] || 0) * 3600 +
-            Number(match[2] || 0) * 60 +
-            Number(match[3] || 0)
-          );
-        }
-
-        // Step 4: Combine video and channel information.
         const videos = (videosData.items || []).map((video) => {
           const channel = channelMap.get(video.snippet.channelId);
           const statistics = channel?.statistics;
+
           const subscriberCount =
             statistics?.subscriberCount !== undefined
               ? Number(statistics.subscriberCount)
@@ -614,13 +603,7 @@ function createServer() {
             subscriberCount,
             hiddenSubscriberCount:
               statistics?.hiddenSubscriberCount ?? false,
-            channelVideoCount:
-              statistics?.videoCount
-                ? Number(statistics.videoCount)
-                : null,
-            views: video.statistics?.viewCount
-              ? Number(video.statistics.viewCount)
-              : 0,
+            views: Number(video.statistics?.viewCount || 0),
             likes: video.statistics?.likeCount
               ? Number(video.statistics.likeCount)
               : null,
@@ -685,6 +668,422 @@ function createServer() {
               text: error instanceof Error
                 ? error.message
                 : "Unable to search public YouTube videos.",
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // Tool 6: Public channel upload history and median-view baseline.
+  server.registerTool(
+    "youtube_channel_upload_history",
+    {
+      description:
+        "Retrieve recent public uploads from up to 10 YouTube channels. Collect video statistics, durations and publication dates. Calculate separate median-view baselines for potential Shorts and long-form candidates using videos at least 7 days old.",
+      inputSchema: z.object({
+        channelIds: z.array(z.string().min(1)).min(1).max(10),
+        maxUploadsPerChannel: z.number().int().min(1).max(30).default(30),
+        minimumAgeDays: z.number().int().min(1).max(90).default(7),
+      }),
+    },
+    async ({ channelIds, maxUploadsPerChannel, minimumAgeDays }) => {
+      try {
+        const uniqueChannelIds = [...new Set(channelIds)];
+
+        const accessToken = await getGoogleAccessToken();
+
+        // Step 1: Retrieve channel upload playlist IDs.
+        const channelsUrl = new URL(
+          "https://www.googleapis.com/youtube/v3/channels",
+        );
+
+        channelsUrl.searchParams.set("part", "snippet,contentDetails,statistics");
+        channelsUrl.searchParams.set(
+          "id",
+          uniqueChannelIds.join(","),
+        );
+
+        const channelsResponse = await fetch(channelsUrl.toString(), {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        });
+
+        if (!channelsResponse.ok) {
+          throw new Error(
+            `YouTube channels API returned ${channelsResponse.status}: ${await channelsResponse.text()}`,
+          );
+        }
+
+        const channelsData = await channelsResponse.json() as {
+          items?: Array<{
+            id: string;
+            snippet?: {
+              title?: string;
+            };
+            contentDetails?: {
+              relatedPlaylists?: {
+                uploads?: string;
+              };
+            };
+            statistics?: {
+              subscriberCount?: string;
+              hiddenSubscriberCount?: boolean;
+            };
+          }>;
+        };
+
+        const channelMap = new Map(
+          (channelsData.items || []).map((channel) => [
+            channel.id,
+            channel,
+          ]),
+        );
+
+        const missingChannelIds = uniqueChannelIds.filter(
+          (id) => !channelMap.has(id),
+        );
+
+        // Step 2: Retrieve recent uploads from each channel.
+        const channelResults = await Promise.all(
+          uniqueChannelIds.map(async (channelId) => {
+            const channel = channelMap.get(channelId);
+
+            if (!channel) {
+              return {
+                channelId,
+                channelTitle: null,
+                subscriberCount: null,
+                hiddenSubscriberCount: false,
+                error: "Channel not found or unavailable.",
+                uploads: [] as Array<{
+                  videoId: string;
+                  playlistPublishedAt: string | null;
+                }>,
+              };
+            }
+
+            const uploadsPlaylistId =
+              channel.contentDetails?.relatedPlaylists?.uploads;
+
+            if (!uploadsPlaylistId) {
+              return {
+                channelId,
+                channelTitle: channel.snippet?.title || null,
+                subscriberCount: channel.statistics?.subscriberCount
+                  ? Number(channel.statistics.subscriberCount)
+                  : null,
+                hiddenSubscriberCount:
+                  channel.statistics?.hiddenSubscriberCount ?? false,
+                error: "Uploads playlist unavailable.",
+                uploads: [] as Array<{
+                  videoId: string;
+                  playlistPublishedAt: string | null;
+                }>,
+              };
+            }
+
+            const playlistUrl = new URL(
+              "https://www.googleapis.com/youtube/v3/playlistItems",
+            );
+
+            playlistUrl.searchParams.set("part", "contentDetails,snippet");
+            playlistUrl.searchParams.set(
+              "playlistId",
+              uploadsPlaylistId,
+            );
+            playlistUrl.searchParams.set(
+              "maxResults",
+              String(maxUploadsPerChannel),
+            );
+
+            const playlistResponse = await fetch(
+              playlistUrl.toString(),
+              {
+                headers: {
+                  Authorization: `Bearer ${accessToken}`,
+                },
+              },
+            );
+
+            if (!playlistResponse.ok) {
+              throw new Error(
+                `Uploads playlist request failed for ${channelId}: ${await playlistResponse.text()}`,
+              );
+            }
+
+            const playlistData = await playlistResponse.json() as {
+              items?: Array<{
+                contentDetails?: {
+                  videoId?: string;
+                  videoPublishedAt?: string;
+                };
+                snippet?: {
+                  publishedAt?: string;
+                  resourceId?: {
+                    videoId?: string;
+                  };
+                };
+              }>;
+            };
+
+            const uploads = (playlistData.items || [])
+              .map((item) => ({
+                videoId:
+                  item.contentDetails?.videoId ||
+                  item.snippet?.resourceId?.videoId ||
+                  "",
+                playlistPublishedAt:
+                  item.contentDetails?.videoPublishedAt ||
+                  item.snippet?.publishedAt ||
+                  null,
+              }))
+              .filter((item) => item.videoId.length > 0);
+
+            return {
+              channelId,
+              channelTitle: channel.snippet?.title || null,
+              subscriberCount: channel.statistics?.subscriberCount
+                ? Number(channel.statistics.subscriberCount)
+                : null,
+              hiddenSubscriberCount:
+                channel.statistics?.hiddenSubscriberCount ?? false,
+              error: null,
+              uploads,
+            };
+          }),
+        );
+
+        // Step 3: Collect video IDs and retrieve video details in batches.
+        const allVideoIds = [
+          ...new Set(
+            channelResults.flatMap((channel) =>
+              channel.uploads.map((upload) => upload.videoId),
+            ),
+          ),
+        ];
+
+        const videoMap = new Map<
+          string,
+          {
+            id: string;
+            title: string;
+            description: string;
+            publishedAt: string;
+            duration: string;
+            durationSeconds: number;
+            views: number;
+            likes: number | null;
+            comments: number | null;
+            thumbnail: string | null;
+            videoUrl: string;
+          }
+        >();
+
+        for (let i = 0; i < allVideoIds.length; i += 50) {
+          const batch = allVideoIds.slice(i, i + 50);
+
+          const videosUrl = new URL(
+            "https://www.googleapis.com/youtube/v3/videos",
+          );
+
+          videosUrl.searchParams.set(
+            "part",
+            "snippet,statistics,contentDetails",
+          );
+          videosUrl.searchParams.set("id", batch.join(","));
+
+          const videosResponse = await fetch(videosUrl.toString(), {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+            },
+          });
+
+          if (!videosResponse.ok) {
+            throw new Error(
+              `YouTube videos API returned ${videosResponse.status}: ${await videosResponse.text()}`,
+            );
+          }
+
+          const videosData = await videosResponse.json() as {
+            items?: Array<{
+              id: string;
+              snippet: {
+                title: string;
+                description: string;
+                publishedAt: string;
+                thumbnails?: {
+                  high?: { url: string };
+                  medium?: { url: string };
+                  default?: { url: string };
+                };
+              };
+              statistics?: {
+                viewCount?: string;
+                likeCount?: string;
+                commentCount?: string;
+              };
+              contentDetails?: {
+                duration?: string;
+              };
+            }>;
+          };
+
+          for (const video of videosData.items || []) {
+            const duration = video.contentDetails?.duration || "";
+            const durationSeconds = duration
+              ? durationToSeconds(duration)
+              : 0;
+
+            videoMap.set(video.id, {
+              id: video.id,
+              title: video.snippet.title,
+              description: video.snippet.description,
+              publishedAt: video.snippet.publishedAt,
+              duration,
+              durationSeconds,
+              views: Number(video.statistics?.viewCount || 0),
+              likes: video.statistics?.likeCount
+                ? Number(video.statistics.likeCount)
+                : null,
+              comments: video.statistics?.commentCount
+                ? Number(video.statistics.commentCount)
+                : null,
+              thumbnail:
+                video.snippet.thumbnails?.high?.url ||
+                video.snippet.thumbnails?.medium?.url ||
+                video.snippet.thumbnails?.default?.url ||
+                null,
+              videoUrl:
+                `https://www.youtube.com/watch?v=${video.id}`,
+            });
+          }
+        }
+
+        // Step 4: Build channel histories and separate baselines.
+        const now = Date.now();
+        const minimumAgeMs = minimumAgeDays * 24 * 60 * 60 * 1000;
+
+        const results = channelResults.map((channel) => {
+          const uploads = channel.uploads
+            .map((upload) => {
+              const video = videoMap.get(upload.videoId);
+              if (!video) return null;
+
+              const ageMs = now - new Date(video.publishedAt).getTime();
+              const ageDays = Math.max(
+                0,
+                Math.floor(ageMs / (24 * 60 * 60 * 1000)),
+              );
+
+              const potentialShort = video.durationSeconds <= 180;
+
+              return {
+                videoId: video.id,
+                title: video.title,
+                description: video.description,
+                publishedAt: video.publishedAt,
+                ageDays,
+                duration: video.duration,
+                durationSeconds: video.durationSeconds,
+                formatCandidate: potentialShort
+                  ? "Potential Short — verify aspect ratio"
+                  : "Long-form candidate",
+                views: video.views,
+                likes: video.likes,
+                comments: video.comments,
+                thumbnail: video.thumbnail,
+                videoUrl: video.videoUrl,
+                oldEnoughForBaseline: ageMs >= minimumAgeMs,
+              };
+            })
+            .filter((video) => video !== null);
+
+          const matureUploads = uploads.filter(
+            (video) => video.oldEnoughForBaseline,
+          );
+
+          const potentialShorts = matureUploads.filter(
+            (video) => video.durationSeconds <= 180,
+          );
+
+          const longForm = matureUploads.filter(
+            (video) => video.durationSeconds > 180,
+          );
+
+          const shortMedianViews = median(
+            potentialShorts.map((video) => video.views),
+          );
+
+          const longFormMedianViews = median(
+            longForm.map((video) => video.views),
+          );
+
+          return {
+            channelId: channel.channelId,
+            channelTitle: channel.channelTitle,
+            channelUrl:
+              `https://www.youtube.com/channel/${channel.channelId}`,
+            subscriberCount: channel.subscriberCount,
+            hiddenSubscriberCount: channel.hiddenSubscriberCount,
+            uploadCountRetrieved: uploads.length,
+            minimumAgeDays,
+            baseline: {
+              potentialShorts: {
+                videosUsed: potentialShorts.length,
+                medianViews: shortMedianViews,
+              },
+              longForm: {
+                videosUsed: longForm.length,
+                medianViews: longFormMedianViews,
+              },
+            },
+            uploads,
+            error: channel.error,
+          };
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  source: "YouTube Data API v3",
+                  requestedChannels: uniqueChannelIds.length,
+                  channelsFound: results.filter(
+                    (channel) => !channel.error,
+                  ).length,
+                  missingChannelIds,
+                  maxUploadsPerChannel,
+                  minimumAgeDays,
+                  results,
+                  notes: [
+                    "A duration of 180 seconds or less identifies only a potential Short; aspect ratio is not provided by this API response.",
+                    "Median baselines use only videos at least the requested minimum age.",
+                    "Potential Shorts and long-form candidates have separate baselines.",
+                    "A median is not calculated when a category has no mature uploads.",
+                    "This tool retrieves public uploads; it does not provide private channel analytics.",
+                  ],
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        console.error("Channel upload history error:", error);
+
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: error instanceof Error
+                ? error.message
+                : "Unable to retrieve channel upload history.",
             },
           ],
         };
